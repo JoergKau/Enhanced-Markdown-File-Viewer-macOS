@@ -23,10 +23,13 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 ## Editor & preview
 
-- Rendered preview by default; **Edit** (⌘P) opens a resizable split view with
+- Rendered preview by default; **Edit** (⌘⇧P) opens a resizable split view with
   the source editor and live preview.
 - Click any preview block to jump to the matching source line; switching views
   keeps the section you were reading or editing.
+- **Find & replace** (⌘F, ⌘G/⇧⌘G) with match counter, next/previous and replace
+  one/all.
+- **Outline sidebar** (⌘⇧O) listing headings; click one to jump to that section.
 - Multiple tabs with per-tab edits, scroll position and unsaved markers.
 - Zoom (⌘+/⌘−, ⌘0), picture viewer with pan/zoom, drag & drop.
 - Large documents are virtualized (visible window plus overscan) above 250
@@ -35,6 +38,8 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
   with run-level bidi ordering for mixed-direction text.
 - Relative `.md` links, wiki-links and wiki embeds open in tabs; `![[Note]]`
   transclusion is cycle-safe.
+- Remote images are fetched with `curl` (HTTP/HTTPS only, redirects restricted)
+  and capped at 25 MB / 40 megapixels.
 
 ## Files
 
@@ -47,7 +52,8 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 ## PDF export
 
-- One-click **Export PDF** (⌘E) with a native save dialog.
+- One-click **Export PDF** (⌘E) with a native save dialog; **Print** (⌘P)
+  exports a temporary PDF and opens it in Preview.
 - A4 pagination, running footer, selectable text, clickable links, embedded
   images, styled code/tables/callouts, typeset math and Mermaid diagrams.
 - Uses the mandatory **WeasyPrint** CLI — no fallback writer. When it is
@@ -60,13 +66,14 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 - Permanent **dark** slate/charcoal theme plus a warm **Paper** light theme.
 - SF Pro for UI and Markdown, SF Mono for code; no font picker.
 - Native app icon, About panel with a clickable project link, status toasts.
-- Keyboard shortcuts: ⌘O, ⌘S, ⌘⇧S, ⌘E, ⌘W, ⌘P, ⌘+/−/0, ⌘X/C/V, ⌘A.
+- Keyboard shortcuts: ⌘O, ⌘S, ⌘⇧S, ⌘E, ⌘P, ⌘W, ⌘F, ⌘G/⇧⌘G, ⌘⇧O, ⌘⇧P,
+  ⌘+/−/0, ⌘X/C/V, ⌘A.
 
 ## Technical
 
 - Rust 2024 · eframe/egui 0.37 · wgpu (Metal) · winit 0.30 ·
   pulldown-cmark 0.13 · arm64 macOS 11+.
-- 110 unit/integration tests plus an ignored deep render pass; zero build,
+- 115 unit/integration tests plus an ignored deep render pass; zero build,
   clippy and rustfmt warnings.
 - `.app` packaging with ad-hoc or Developer ID signing, optional notarization,
   and a zipped arm64 release archive with SHA-256 checksum.

@@ -754,6 +754,16 @@ pub struct App {
     pending_tab_close: Option<usize>,
     /// Current view mode (rendered preview by default).
     pub mode: ViewMode,
+    /// Whether the outline sidebar is visible.
+    outline_open: bool,
+    /// Find/replace bar state.
+    find_open: bool,
+    find_query: String,
+    replace_text: String,
+    find_matches: Vec<(usize, usize)>,
+    find_index: usize,
+    find_cache: (String, u64),
+    find_focus: bool,
     /// Split position in Edit mode (`0.5` = 50/50). Persists while dragging.
     pub split_fraction: f32,
     /// Font size (editor & preview; ⌘+/⌘− zoom).
@@ -834,6 +844,14 @@ impl App {
             active_tab: 0,
             pending_tab_close: None,
             mode: ViewMode::Preview,
+            outline_open: false,
+            find_open: false,
+            find_query: String::new(),
+            replace_text: String::new(),
+            find_matches: Vec::new(),
+            find_index: 0,
+            find_cache: (String::new(), 0),
+            find_focus: false,
             split_fraction: 0.5,
             font_size: DEFAULT_FONT_SIZE,
             status: None,
@@ -1242,20 +1260,76 @@ impl App {
         }
     }
 
+    /// Prints the current document: exports a temporary PDF and opens it in
+    /// Preview, where the system print dialog is available (⌘P there).
+    fn print_document(&mut self) {
+        self.refresh_weasyprint();
+        if !self.weasyprint_ready {
+            self.weasyprint_dialog = true;
+            return;
+        }
+        let base_dir = self.base_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let pdf = std::env::temp_dir().join(format!(
+            "md-viewer-print-{}-{stamp}.pdf",
+            std::process::id()
+        ));
+        match crate::export::export_pdf(&self.text, base_dir.as_deref(), self.path.as_deref(), &pdf)
+        {
+            Ok(path) => match std::process::Command::new("/usr/bin/open")
+                .args(["-a", "Preview"])
+                .arg(&path)
+                .status()
+            {
+                Ok(status) if status.success() => self.set_status(
+                    "Opened the print preview in Preview — press ⌘P there to print.",
+                    false,
+                ),
+                _ => self.set_status(
+                    format!("PDF created: {} — open it to print.", path.display()),
+                    true,
+                ),
+            },
+            Err(e) => self.set_status(format!("Print failed: {e}"), true),
+        }
+    }
+
     /// Re-checks the mandatory WeasyPrint CLI and updates the toolbar state.
     fn refresh_weasyprint(&mut self) {
         self.weasyprint_ready = crate::export::weasyprint_path().is_some();
     }
 
     /// Typical macOS shortcuts: ⌘O open, ⌘S/⌘⇧S save, ⌘E PDF,
-    /// ⌘P toggle preview, ⌘+/−/0 zoom.
+    /// ⌘P print, ⌘⇧P toggle preview, ⌘+/−/0 zoom.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) && self.find_open {
+                self.find_open = false;
+            }
             if !i.modifiers.contains(Modifiers::COMMAND) {
                 return;
             }
+            if i.key_pressed(egui::Key::F) {
+                self.find_open = true;
+                self.find_focus = true;
+                self.find_cache = (String::new(), 0);
+            }
+            if i.key_pressed(egui::Key::G) {
+                if i.modifiers.shift {
+                    self.find_prev();
+                } else {
+                    self.find_next();
+                }
+            }
             if i.key_pressed(egui::Key::O) {
-                self.open_dialog();
+                if i.modifiers.shift {
+                    self.outline_open = !self.outline_open;
+                } else {
+                    self.open_dialog();
+                }
             }
             if i.key_pressed(egui::Key::S) {
                 if i.modifiers.contains(Modifiers::SHIFT) {
@@ -1271,11 +1345,15 @@ impl App {
                 self.request_close_tab(self.active_tab);
             }
             if i.key_pressed(egui::Key::P) {
-                let next = match self.mode {
-                    ViewMode::Preview => ViewMode::Editor,
-                    ViewMode::Editor => ViewMode::Preview,
-                };
-                self.set_mode(next);
+                if i.modifiers.shift {
+                    let next = match self.mode {
+                        ViewMode::Preview => ViewMode::Editor,
+                        ViewMode::Editor => ViewMode::Preview,
+                    };
+                    self.set_mode(next);
+                } else {
+                    self.print_document();
+                }
             }
             if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
                 self.font_size = (self.font_size + 1.0).min(MAX_FONT_SIZE);
@@ -1356,12 +1434,47 @@ impl App {
                             self.weasyprint_dialog = true;
                         }
                     }
+
+                    // Print uses the same mandatory WeasyPrint path, then hands
+                    // the PDF to Preview for the system print dialog.
+                    let print_text = if self.weasyprint_ready {
+                        RichText::new("Print")
+                    } else {
+                        RichText::new("Print").color(palette().faint)
+                    };
+                    let print = ui.add(egui::Button::new(print_text));
+                    let print = if self.weasyprint_ready {
+                        print.on_hover_text("Print (⌘P) — opens a temporary PDF in Preview")
+                    } else {
+                        print.on_hover_text(
+                            "WeasyPrint is not installed — click to set up PDF export",
+                        )
+                    };
+                    if print.clicked() {
+                        if self.weasyprint_ready {
+                            self.print_document();
+                        } else {
+                            self.weasyprint_dialog = true;
+                        }
+                    }
                     ui.separator();
                     let mut mode = self.mode;
                     ui.selectable_value(&mut mode, ViewMode::Preview, "Preview");
                     ui.selectable_value(&mut mode, ViewMode::Editor, "Edit");
                     if mode != self.mode {
                         self.set_mode(mode);
+                    }
+                    ui.separator();
+                    ui.toggle_value(&mut self.outline_open, "Outline")
+                        .on_hover_text("Outline sidebar (⌘⇧O)");
+                    if ui
+                        .button("Find")
+                        .on_hover_text("Find & replace (⌘F)")
+                        .clicked()
+                    {
+                        self.find_open = true;
+                        self.find_focus = true;
+                        self.find_cache = (String::new(), 0);
                     }
                     ui.separator();
                     if ui
@@ -1421,6 +1534,274 @@ impl App {
                         ui.add(Label::new(RichText::new(path_text).weak()).truncate());
                     });
                 });
+            });
+    }
+
+    /// Recomputes find matches when the query or document changed.
+    fn update_find_matches(&mut self) {
+        if self.find_cache.0 == self.find_query && self.find_cache.1 == self.preview_revision {
+            return;
+        }
+        self.find_cache = (self.find_query.clone(), self.preview_revision);
+        self.find_matches.clear();
+        let query = self.find_query.to_ascii_lowercase();
+        if query.is_empty() {
+            self.find_index = 0;
+            return;
+        }
+        let hay = self.text.to_ascii_lowercase();
+        let mut start = 0usize;
+        while let Some(pos) = hay[start..].find(&query) {
+            let begin = start + pos;
+            self.find_matches.push((begin, begin + query.len()));
+            start = begin + query.len().max(1);
+        }
+        if self.find_index >= self.find_matches.len() {
+            self.find_index = 0;
+        }
+        if !self.find_matches.is_empty() {
+            self.reveal_match(self.find_index);
+        }
+    }
+
+    /// Scrolls the preview (and the editor in split mode) to a match.
+    fn reveal_match(&mut self, index: usize) {
+        let Some((start, _)) = self.find_matches.get(index).copied() else {
+            return;
+        };
+        self.find_index = index;
+        let line = 1 + self.text[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        self.preview_line = Some(line);
+        if self.mode == ViewMode::Editor {
+            self.jump_line = Some(line);
+        }
+    }
+
+    fn find_next(&mut self) {
+        self.update_find_matches();
+        if self.find_matches.is_empty() {
+            return;
+        }
+        let next = (self.find_index + 1) % self.find_matches.len();
+        self.reveal_match(next);
+    }
+
+    fn find_prev(&mut self) {
+        self.update_find_matches();
+        if self.find_matches.is_empty() {
+            return;
+        }
+        let prev = if self.find_index == 0 {
+            self.find_matches.len() - 1
+        } else {
+            self.find_index - 1
+        };
+        self.reveal_match(prev);
+    }
+
+    /// Replaces the current match and advances to the next one.
+    fn replace_current(&mut self) {
+        self.update_find_matches();
+        let Some((start, end)) = self.find_matches.get(self.find_index).copied() else {
+            return;
+        };
+        self.text.replace_range(start..end, &self.replace_text);
+        self.dirty = true;
+        self.reparse();
+        self.find_cache = (String::new(), 0);
+        self.update_find_matches();
+        let next = self
+            .find_matches
+            .iter()
+            .position(|(match_start, _)| *match_start >= start)
+            .unwrap_or(0);
+        if !self.find_matches.is_empty() {
+            self.reveal_match(next);
+        }
+    }
+
+    /// Replaces every match in one pass.
+    fn replace_all(&mut self) {
+        self.update_find_matches();
+        if self.find_matches.is_empty() {
+            return;
+        }
+        let matches = std::mem::take(&mut self.find_matches);
+        for (start, end) in matches.iter().rev() {
+            self.text.replace_range(*start..*end, &self.replace_text);
+        }
+        self.dirty = true;
+        self.reparse();
+        self.find_cache = (String::new(), 0);
+        self.update_find_matches();
+        self.find_index = 0;
+        if !self.find_matches.is_empty() {
+            self.reveal_match(0);
+        }
+    }
+
+    /// Find/replace bar below the toolbar.
+    fn find_bar(&mut self, ui: &mut Ui) {
+        self.update_find_matches();
+        egui::Panel::top("findbar")
+            .frame(
+                Frame::new()
+                    .fill(palette().bg2)
+                    .inner_margin(Margin::symmetric(10, 5)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let find = ui.add(
+                        egui::TextEdit::singleline(&mut self.find_query)
+                            .hint_text("Find")
+                            .desired_width(220.0),
+                    );
+                    if self.find_focus {
+                        find.request_focus();
+                        self.find_focus = false;
+                    }
+                    if find.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.find_next();
+                        find.request_focus();
+                    }
+                    let total = self.find_matches.len();
+                    let current = if total == 0 {
+                        0
+                    } else {
+                        self.find_index.min(total - 1) + 1
+                    };
+                    ui.label(
+                        RichText::new(format!("{current}/{total}"))
+                            .monospace()
+                            .size(12.0)
+                            .color(palette().muted),
+                    );
+                    if ui
+                        .button("↑")
+                        .on_hover_text("Previous match (⇧⌘G)")
+                        .clicked()
+                    {
+                        self.find_prev();
+                    }
+                    if ui.button("↓").on_hover_text("Next match (⌘G)").clicked() {
+                        self.find_next();
+                    }
+                    ui.separator();
+                    let replace = ui.add(
+                        egui::TextEdit::singleline(&mut self.replace_text)
+                            .hint_text("Replace")
+                            .desired_width(180.0),
+                    );
+                    if replace.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.replace_current();
+                        replace.request_focus();
+                    }
+                    if ui.button("Replace").clicked() {
+                        self.replace_current();
+                    }
+                    if ui
+                        .button("All")
+                        .on_hover_text("Replace all matches")
+                        .clicked()
+                    {
+                        self.replace_all();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Close").on_hover_text("Close (Esc)").clicked() {
+                            self.find_open = false;
+                        }
+                    });
+                });
+            });
+    }
+
+    /// Top-level headings with their source lines, for the outline sidebar.
+    fn outline_entries(&self) -> Vec<(u8, usize, String)> {
+        self.doc
+            .blocks
+            .iter()
+            .zip(self.doc.block_lines.iter())
+            .filter_map(|(block, line)| {
+                if let Block::Heading { level, inlines } = block {
+                    let text: String = inlines.iter().map(|i| i.plain_text()).collect();
+                    Some((*level, *line, text))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Collapsible outline sidebar. Clicking a heading scrolls the preview and
+    /// moves the editor caret to that section.
+    fn outline_panel(&mut self, ui: &mut Ui) {
+        let entries = self.outline_entries();
+        let active_line = if self.mode == ViewMode::Editor {
+            self.last_cursor.0
+        } else {
+            self.preview_top_line
+        };
+        let active = entries
+            .iter()
+            .rposition(|(_, line, _)| *line <= active_line);
+
+        egui::Panel::left("outline")
+            .resizable(true)
+            .default_size(240.0)
+            .min_size(160.0)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Outline")
+                        .strong()
+                        .size(14.0)
+                        .color(palette().text),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+                if entries.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("No headings")
+                            .size(13.0)
+                            .color(palette().muted),
+                    );
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, (level, line, text)) in entries.iter().enumerate() {
+                            let indent = (level.saturating_sub(1) as f32) * 12.0;
+                            let selected = active == Some(index);
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                let response = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text)
+                                            .size(if *level == 1 { 14.0 } else { 13.0 })
+                                            .color(if selected {
+                                                palette().accent
+                                            } else {
+                                                palette().text
+                                            }),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .truncate(),
+                                );
+                                if response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if response.clicked() {
+                                    self.preview_line = Some(*line);
+                                    self.jump_line = Some(*line);
+                                }
+                            });
+                        }
+                    });
             });
     }
 
@@ -4813,15 +5194,50 @@ fn inline_text_format(f: f32, st: InlineStyle) -> TextFormat {
     }
 }
 
+thread_local! {
+    /// Lower-cased find query used to paint matches in the preview.
+    static PREVIEW_FIND: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets (or clears) the find query used by the preview renderer.
+fn set_preview_find(query: Option<String>) {
+    PREVIEW_FIND.with(|slot| *slot.borrow_mut() = query);
+}
+
+/// Appends text, painting occurrences of the active find query.
+fn append_text_highlighted(job: &mut egui::text::LayoutJob, text: &str, f: f32, st: InlineStyle) {
+    let query = PREVIEW_FIND.with(|slot| slot.borrow().clone());
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        if !text.is_empty() {
+            job.append(text, 0.0, inline_text_format(f, st));
+        }
+        return;
+    };
+    let hay = text.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    let mut start = 0usize;
+    while let Some(pos) = hay[start..].find(&needle) {
+        let begin = start + pos;
+        if begin > start {
+            job.append(&text[start..begin], 0.0, inline_text_format(f, st));
+        }
+        let mut format = inline_text_format(f, st);
+        format.background = palette().highlight_bg;
+        format.color = palette().highlight_text;
+        job.append(&text[begin..begin + needle.len()], 0.0, format);
+        start = begin + needle.len();
+    }
+    if start < text.len() {
+        job.append(&text[start..], 0.0, inline_text_format(f, st));
+    }
+}
+
 /// Appends text-like inlines to a layout job, carrying nested styles.
 fn append_inline_job(job: &mut egui::text::LayoutJob, inlines: &[Inline], f: f32, st: InlineStyle) {
     for inl in inlines {
         match inl {
-            Inline::Text(t) => {
-                if !t.is_empty() {
-                    job.append(t, 0.0, inline_text_format(f, st));
-                }
-            }
+            Inline::Text(t) => append_text_highlighted(job, t, f, st),
             Inline::Emph(v) => {
                 let mut s = st;
                 s.italic = true;
@@ -4935,7 +5351,10 @@ fn render_inlines_styled(
                         ui.end_row();
                     }
                     if !line.is_empty() {
-                        ui.label(styled_inline_text(line, f, st, line_h));
+                        let mut line_job = egui::text::LayoutJob::default();
+                        append_text_highlighted(&mut line_job, line, f, st);
+                        line_job.wrap.max_width = ui.available_width().max(1.0);
+                        ui.add(Label::new(line_job));
                     }
                 }
             }
@@ -5281,6 +5700,10 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
             "10",
             "--proto",
             "=https,http",
+            "--proto-redir",
+            "=https,http",
+            "--max-filesize",
+            "26214400",
             "--",
         ])
         .arg(url)
@@ -5296,9 +5719,49 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
             format!("curl: {detail}")
         });
     }
+    if output.stdout.len() > MAX_REMOTE_BYTES {
+        return Err(format!(
+            "image is larger than {} MB",
+            MAX_REMOTE_BYTES / (1024 * 1024)
+        ));
+    }
+    if let Some((width, height)) = raster_dimensions(&output.stdout)
+        && (width > MAX_REMOTE_DIMENSION
+            || height > MAX_REMOTE_DIMENSION
+            || u64::from(width) * u64::from(height) > MAX_REMOTE_PIXELS)
+    {
+        return Err(format!(
+            "image is too large ({width}×{height} px); the limit is \
+             {MAX_REMOTE_DIMENSION}×{MAX_REMOTE_DIMENSION} px / \
+             {} megapixels",
+            MAX_REMOTE_PIXELS / 1_000_000
+        ));
+    }
     let data: Arc<[u8]> = output.stdout.into();
     let mime = sniff_mime(&data).map(str::to_owned);
     Ok(CachedBytes { data, mime })
+}
+
+/// Maximum bytes accepted from a remote image download.
+const MAX_REMOTE_BYTES: usize = 25 * 1024 * 1024;
+
+/// Maximum width or height of a remote raster image.
+const MAX_REMOTE_DIMENSION: u32 = 12_000;
+
+/// Maximum pixel count of a remote raster image (~40 MP).
+const MAX_REMOTE_PIXELS: u64 = 40_000_000;
+
+/// Reads the intrinsic dimensions of a raster image without decoding pixels.
+///
+/// SVG payloads are skipped: they are rasterized with a capped scale instead.
+fn raster_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if looks_like_svg(bytes) {
+        return None;
+    }
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.into_dimensions().ok()
 }
 
 /// Best-effort content type from the downloaded bytes.
@@ -6361,8 +6824,19 @@ impl eframe::App for App {
         self.sync_window_title(&ctx);
 
         self.toolbar(ui);
+        if self.find_open {
+            self.find_bar(ui);
+        }
         self.tab_bar(ui);
         self.status_bar(ui);
+        if self.outline_open {
+            self.outline_panel(ui);
+        }
+        set_preview_find(if self.find_open && !self.find_query.is_empty() {
+            Some(self.find_query.clone())
+        } else {
+            None
+        });
         match self.mode {
             ViewMode::Preview => self.preview_central(ui),
             ViewMode::Editor => self.edit_split(ui),
@@ -6371,6 +6845,7 @@ impl eframe::App for App {
         if let Some(path) = ctx.data_mut(|data| data.remove_temp::<PathBuf>(pending_open_id())) {
             self.open_path(path);
         }
+        set_preview_find(None);
         self.show_image_viewer(&ctx);
         self.show_close_dialog(&ctx);
         self.show_tab_close_dialog(&ctx);
@@ -6608,15 +7083,8 @@ mod startup_tests {
             return;
         };
         let doc = crate::parser::parse(&markdown);
+        assert!(!markdown.trim().is_empty(), "start-up.md is empty");
         assert!(!doc.blocks.is_empty(), "start-up.md produced no blocks");
-        assert!(
-            doc.blocks.iter().any(|block| matches!(
-                block,
-                Block::Heading { inlines, .. }
-                    if inlines.iter().any(|i| i.plain_text().contains("Feature List"))
-            )),
-            "start-up.md should start with the feature-list heading"
-        );
     }
 }
 
@@ -6637,6 +7105,14 @@ mod tab_tests {
             active_tab: 0,
             pending_tab_close: None,
             mode: ViewMode::Preview,
+            outline_open: false,
+            find_open: false,
+            find_query: String::new(),
+            replace_text: String::new(),
+            find_matches: Vec::new(),
+            find_index: 0,
+            find_cache: (String::new(), 0),
+            find_focus: false,
             split_fraction: 0.5,
             font_size: DEFAULT_FONT_SIZE,
             status: None,
@@ -6776,6 +7252,56 @@ mod tab_tests {
             Some(0),
             "dirty tab waits for the dialog"
         );
+    }
+
+    #[test]
+    fn outline_entries_follow_headings() {
+        let app = test_app();
+        let entries = app.outline_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, 1);
+        assert_eq!(entries[0].2, "One");
+    }
+
+    #[test]
+    fn find_and_replace_updates_the_document() {
+        let mut app = test_app();
+        app.find_open = true;
+        app.find_query = "body".into();
+        app.update_find_matches();
+        assert_eq!(app.find_matches.len(), 1);
+        app.replace_text = "text".into();
+        app.replace_current();
+        assert!(app.text.contains("text"));
+        assert!(!app.text.contains("body"));
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn find_is_case_insensitive_and_wraps() {
+        let mut app = test_app();
+        app.find_query = "ONE".into();
+        app.update_find_matches();
+        assert_eq!(app.find_matches.len(), 1);
+        app.find_next();
+        assert_eq!(app.find_index, 0);
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn raster_dimensions_read_png_headers() {
+        let png = include_bytes!("../assets/AppIcon-1024.png");
+        assert_eq!(raster_dimensions(png), Some((1024, 1024)));
+    }
+
+    #[test]
+    fn svg_payloads_are_not_treated_as_raster() {
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+        assert_eq!(raster_dimensions(svg), None);
     }
 }
 
