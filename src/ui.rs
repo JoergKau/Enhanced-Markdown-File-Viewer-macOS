@@ -6612,9 +6612,10 @@ mod startup_tests {
         assert!(
             doc.blocks.iter().any(|block| matches!(
                 block,
-                Block::BlockQuote { title: Some(title), .. } if title.contains("Feature List")
+                Block::Heading { inlines, .. }
+                    if inlines.iter().any(|i| i.plain_text().contains("Feature List"))
             )),
-            "start-up.md should start with the feature-list callout title"
+            "start-up.md should start with the feature-list heading"
         );
     }
 }
