@@ -25,6 +25,9 @@ unicode-bidi = "0.3.18"
 toml = "0.8.23"
 serde_json = "1.0.145"
 
-# macOS glue for Finder "Open With" events (see src/macos_open.rs).
+# macOS glue for Finder "Open With" events (see src/macos_open.rs) and the
+# About panel credits (see src/macos_about.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSAttributedString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSAttributedString"] }

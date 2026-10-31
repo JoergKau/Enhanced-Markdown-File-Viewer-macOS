@@ -175,7 +175,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-All tests must pass and there should be zero warnings. The 104 tests cover the
+All tests must pass and there should be zero warnings. The 105 tests cover the
 parser (including HTML block conversion and the extended compatibility
 corpus), the print-HTML renderer (preprocessors, sanitizer, template,
 math/Mermaid image embedding, escape/base64 helpers), the WeasyPrint runner
@@ -353,7 +353,7 @@ iconutil -c icns AppIcon.iconset -o AppIcon.icns
 | Open from Finder | Works for cold starts and running instances (macOS Apple Event integration) |
 | Save | Toolbar **Save**, ⌘S |
 | Save as | ⌘⇧S |
-| Export PDF | Toolbar **Export PDF**, ⌘E (requires WeasyPrint; the app shows the install command if it is missing) |
+| Export PDF | Toolbar **Export PDF**, ⌘E. Without WeasyPrint the button is greyed out and opens the setup dialog; the rest of the app works normally |
 | Toggle dark / Paper theme | Toolbar sun/moon button at the right (sun = dark active, moon = Paper active) |
 | Switch view | Toolbar **Preview / Edit**, ⌘P — Edit shows raw text left and live preview right |
 | Zoom | Toolbar **A−/A+**, ⌘+/⌘−; the percentage readout between them shows the current magnification and resets to 100% when clicked (also ⌘0) |
@@ -380,6 +380,7 @@ MD-Viewer/
 └── src/
     ├── main.rs               # entry point, window + wgpu setup
     ├── macos_open.rs         # Finder "Open With" Apple Event integration
+    ├── macos_about.rs        # About panel credits (project page)
     ├── parser.rs             # Markdown → Document model
     ├── encoding.rs           # UTF-8/UTF-16/legacy file decoding
     ├── ui.rs                 # egui app: theme, panels, preview, highlighting

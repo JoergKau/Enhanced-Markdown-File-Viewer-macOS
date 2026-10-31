@@ -803,6 +803,9 @@ pub struct App {
     /// WeasyPrint onboarding dialog. Shown once per launch when the CLI is
     /// missing, and again when PDF export is attempted without it.
     weasyprint_dialog: bool,
+    /// Whether the WeasyPrint CLI was found. Controls the Export PDF button
+    /// (greyed out while PDF export is unavailable).
+    weasyprint_ready: bool,
     /// Whether the macOS open-document delegate hooks are installed.
     open_glue_installed: bool,
 }
@@ -833,6 +836,7 @@ impl App {
         let doc = parser::parse(&text);
         let line_count = text.lines().count();
         let word_count = text.split_whitespace().count();
+        let weasyprint_ready = crate::export::weasyprint_path().is_some();
         let mut app = Self {
             text,
             doc,
@@ -857,7 +861,8 @@ impl App {
             preview_line: None,
             preview_top_line: 1,
             close_dialog: false,
-            weasyprint_dialog: crate::export::weasyprint_path().is_none(),
+            weasyprint_dialog: !weasyprint_ready,
+            weasyprint_ready,
             open_glue_installed: false,
         };
         app.store_active();
@@ -1211,9 +1216,10 @@ impl App {
     /// WeasyPrint is mandatory: failures are reported in the status bar and
     /// nothing is written.
     fn export_pdf(&mut self) {
-        // WeasyPrint is mandatory. Instead of opening a save dialog that can
-        // only fail, show the installation onboarding again.
-        if crate::export::weasyprint_path().is_none() {
+        // Re-check so a WeasyPrint installed while the app is running is
+        // picked up without a restart.
+        self.refresh_weasyprint();
+        if !self.weasyprint_ready {
             self.weasyprint_dialog = true;
             return;
         }
@@ -1239,6 +1245,11 @@ impl App {
             Ok(path) => self.set_status(format!("PDF exported: {}", path.display()), false),
             Err(e) => self.set_status(format!("PDF export failed: {e}"), true),
         }
+    }
+
+    /// Re-checks the mandatory WeasyPrint CLI and updates the toolbar state.
+    fn refresh_weasyprint(&mut self) {
+        self.weasyprint_ready = crate::export::weasyprint_path().is_some();
     }
 
     /// Typical macOS shortcuts: ⌘O open, ⌘S/⌘⇧S save, ⌘E PDF,
@@ -1327,8 +1338,28 @@ impl App {
                     if ui.button(save_label).clicked() {
                         self.save();
                     }
-                    if ui.button("Export PDF").clicked() {
-                        self.export_pdf();
+                    // PDF export is unavailable without WeasyPrint. The button
+                    // stays visible but greyed; clicking it reopens the setup
+                    // dialog instead of a save dialog that can only fail.
+                    let pdf_text = if self.weasyprint_ready {
+                        RichText::new("Export PDF")
+                    } else {
+                        RichText::new("Export PDF").color(palette().faint)
+                    };
+                    let export = ui.add(egui::Button::new(pdf_text));
+                    let export = if self.weasyprint_ready {
+                        export
+                    } else {
+                        export.on_hover_text(
+                            "WeasyPrint is not installed — click to set up PDF export",
+                        )
+                    };
+                    if export.clicked() {
+                        if self.weasyprint_ready {
+                            self.export_pdf();
+                        } else {
+                            self.weasyprint_dialog = true;
+                        }
                     }
                     ui.separator();
                     let mut mode = self.mode;
@@ -1887,7 +1918,8 @@ impl App {
             close = true;
         }
         if check {
-            if crate::export::weasyprint_path().is_some() {
+            self.refresh_weasyprint();
+            if self.weasyprint_ready {
                 self.weasyprint_dialog = false;
                 self.set_status("WeasyPrint found — PDF export is ready.", false);
             } else {
@@ -6578,6 +6610,7 @@ mod tab_tests {
             preview_top_line: 1,
             close_dialog: false,
             weasyprint_dialog: false,
+            weasyprint_ready: false,
             open_glue_installed: false,
         };
         app.store_active();

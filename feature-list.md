@@ -148,7 +148,7 @@ embedded images.
 | One-click export | ✅ | Toolbar button or ⌘E opens a native save dialog. A missing `.pdf` extension is added automatically. |
 | Print pipeline | ✅ | Fenced/inline code is protected, YAML front matter stripped, math/emoji/wiki-link/callout preprocessors run, pulldown-cmark renders GFM (tables, task lists, footnotes), and ammonia sanitizes the HTML with the same tag/attribute policy as the reference implementation. |
 | Mandatory WeasyPrint | ✅ | Single export path via the `weasyprint` CLI, looked up in `PATH` and `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` (works when launched from Finder). Missing/failing binary = error, never a degraded or broken PDF. |
-| WeasyPrint onboarding | ✅ | WeasyPrint is not bundled. When the CLI is missing, a dialog at launch explains that only PDF export needs it, shows the copyable `brew install weasyprint` command, links to weasyprint.org and offers **Check again** (no restart required). The same dialog appears if Export PDF is invoked without the CLI; the editor and preview are unaffected. |
+| WeasyPrint onboarding | ✅ | WeasyPrint is not bundled. When the CLI is missing, a dialog at launch explains that only PDF export needs it, shows the copyable `brew install weasyprint` command, links to weasyprint.org and offers **Check again** (no restart required). The **Export PDF** toolbar button is greyed out and reopens this dialog instead of a save dialog; the editor and preview remain fully usable. |
 | A4 pagination | ✅ | `@page` A4 with 2 cm side/top margins and a 2.5 cm bottom margin; page breaks are automatic. |
 | Page footer | ✅ | Running footer `"<file name> - Page n of m"` using CSS page counters. |
 | Text & typography | ✅ | Selectable text, 10 pt body, system font stack with Unicode fallback, GitHub-style `.markdown-body` spacing, `page-break-after: avoid` on headings and `page-break-inside: avoid` for code blocks, block quotes and callouts. Tables may break between rows and repeat their header on each page, so long tables do not leave empty pages. |
@@ -182,6 +182,7 @@ embedded images.
 | High-performance GPU | ✅ | wgpu `PowerPreference::HighPerformance`. |
 | Status toasts | ✅ | Success/error messages auto-hide after ~4 seconds. |
 | Keyboard shortcuts | ✅ | See table below. |
+| About panel | ✅ | **MD-Viewer → About MD-Viewer** shows the standard panel, grown to fit a two-line credits block at the bottom: *Enhanced Markdown File Viewer for macOS* and *Project Page: https://github.com/JoergKau*. Implemented by swizzling `orderFrontStandardAboutPanel:` so the menu item opens the options variant. |
 
 ### Keyboard shortcuts
 
@@ -221,7 +222,7 @@ embedded images.
 | External runtime dependencies | WeasyPrint (`brew install weasyprint`) is required for PDF export; the app shows an onboarding dialog with the command when it is missing. The editor and preview need no external runtime (remote images use the system `curl`). |
 | Target platform | macOS 11+ on Apple Silicon (arm64) only; Intel is not supported |
 | Distribution | `build_app.sh` creates the `.app` bundle, signs it (ad-hoc locally, Developer ID + hardened runtime when configured), optionally notarizes and staples it, and writes a zipped arm64 release archive with a SHA-256 checksum. |
-| Test coverage | 104 unit/integration tests + 1 ignored deep test: parser (CommonMark/GFM, tight/loose lists, nested inline styles, HTML `<sub>`/`<sup>`, HTML block conversion, the extended compatibility corpus, tables with spans, math incl. row breaks, Mermaid, wiki-links, footnotes), print HTML (preprocessors, sanitizer, template, base64, escaping, callout/fence ordering, typeset math and Mermaid images), WeasyPrint runner (missing/failing binary, real end-to-end export when installed), dark/Paper palettes, tabs (labels, switching, edit preservation, closing), encoding detection (BOM/UTF-16/legacy), bidi run ordering, link resolution, preview virtualization, Pandoc/MkDocs/Obsidian extensions, front matter formats, media/SVG handling, compiled-in test fixtures, picture-viewer logic, magnification readout, LaTeX texture rendering |
+| Test coverage | 105 unit/integration tests + 1 ignored deep test: parser (CommonMark/GFM, tight/loose lists, nested inline styles, HTML `<sub>`/`<sup>`, HTML block conversion, the extended compatibility corpus, tables with spans, math incl. row breaks, Mermaid, wiki-links, footnotes), print HTML (preprocessors, sanitizer, template, base64, escaping, callout/fence ordering, typeset math and Mermaid images), WeasyPrint runner (missing/failing binary, real end-to-end export when installed), dark/Paper palettes, tabs (labels, switching, edit preservation, closing), encoding detection (BOM/UTF-16/legacy), bidi run ordering, link resolution, preview virtualization, Pandoc/MkDocs/Obsidian extensions, front matter formats, media/SVG handling, compiled-in test fixtures, picture-viewer logic, magnification readout, LaTeX texture rendering |
 | Warnings | Zero `cargo build` warnings, zero `cargo clippy` warnings |
 
 ---
