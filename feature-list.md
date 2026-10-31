@@ -42,7 +42,9 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
   **Open With** (cold start and running instance).
 - Close confirmation with **Save / Don't Save / Cancel**; closing the window
   saves all dirty tabs.
-- `start-up.md` is loaded at launch; deleting it starts an empty document.
+- `start-up.md` is loaded at launch as an untitled document; its relative
+  images (the logo) resolve against its folder. Deleting it starts an empty
+  document.
 
 ## PDF export
 
