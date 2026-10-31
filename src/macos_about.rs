@@ -56,7 +56,8 @@ mod imp {
     use objc2::{Message, class, msg_send};
     use objc2_app_kit::{
         NSAboutPanelOptionApplicationIcon, NSAboutPanelOptionApplicationName,
-        NSAboutPanelOptionCredits, NSAboutPanelOptionVersion, NSImage,
+        NSAboutPanelOptionCredits, NSAboutPanelOptionVersion, NSImage, NSMutableParagraphStyle,
+        NSTextAlignment,
     };
     use objc2_foundation::{
         NSBundle, NSDictionary, NSMutableAttributedString, NSRange, NSString, NSURL,
@@ -95,8 +96,23 @@ mod imp {
     /// `NSLinkAttributeName` is not exposed by objc2-foundation; its raw
     /// value is the string `NSLink`.
     pub(super) fn attributed_credits() -> Retained<NSMutableAttributedString> {
-        let text = NSString::from_str(&super::credits_text(!has_bundle()));
+        let text_value = super::credits_text(!has_bundle());
+        let text = NSString::from_str(&text_value);
         let credits = NSMutableAttributedString::from_nsstring(&text);
+
+        // Center the whole block and give each line (notably the copyright)
+        // breathing room; the options variant otherwise uses tight,
+        // left-aligned paragraphs.
+        let style = NSMutableParagraphStyle::new();
+        style.setAlignment(NSTextAlignment::Center);
+        style.setParagraphSpacing(4.0);
+        let style_key = NSString::from_str("NSParagraphStyle");
+        let full_range = NSRange::new(0, text_value.encode_utf16().count());
+        // SAFETY: `NSParagraphStyle` expects an NSParagraphStyle value; the
+        // range covers the whole UTF-16 string.
+        unsafe {
+            credits.addAttribute_value_range(&style_key, as_any(&*style), full_range);
+        }
 
         let link_key = NSString::from_str("NSLink");
         let url_text = NSString::from_str(super::PROJECT_PAGE);
