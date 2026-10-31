@@ -34,9 +34,15 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Credits block: two project lines, plus the copyright when the binary runs
 /// without a bundle (`cargo run`), where `Info.plist` cannot supply it.
 fn credits_text(with_copyright: bool) -> String {
-    let mut text = format!("{CREDITS_PREFIX}{PROJECT_PAGE}");
+    // Blank line under the version; the standard About panel otherwise places
+    // the credits directly beneath it.
+    let mut text = String::from("\n");
+    text.push_str(CREDITS_PREFIX);
+    text.push_str(PROJECT_PAGE);
     if with_copyright {
-        text.push('\n');
+        // Blank line between the project link and the copyright, matching the
+        // gap the standard About panel leaves before its copyright field.
+        text.push_str("\n\n");
         text.push_str(COPYRIGHT);
     }
     text
@@ -119,7 +125,13 @@ mod imp {
         if let Some(url) = NSURL::URLWithString(&url_text) {
             // The dictionary/attribute APIs store values as `AnyObject`.
             let url_object: &AnyObject = unsafe { as_any(&*url) };
-            let range = NSRange::new(super::CREDITS_PREFIX.len(), super::PROJECT_PAGE.len());
+            // The link range follows the actual URL position, which shifts
+            // when the bare panel adds its leading blank line.
+            let link_start = text_value
+                .find(super::PROJECT_PAGE)
+                .map(|byte| text_value[..byte].encode_utf16().count())
+                .unwrap_or(0);
+            let range = NSRange::new(link_start, super::PROJECT_PAGE.len());
             // SAFETY: `NSLink` expects an NSURL value; the range is the exact
             // UTF-16 span of the URL inside the credits string.
             unsafe {
@@ -179,16 +191,16 @@ mod tests {
     fn credits_contain_the_project_page() {
         let text = super::credits_text(false);
         assert!(text.contains("Project Page: https://github.com/JoergKau"));
-        assert_eq!(text.lines().count(), 2);
+        assert_eq!(text.lines().count(), 3);
     }
 
     #[test]
     fn bundled_and_unbundled_credits_differ_only_by_the_copyright() {
         let bundled = super::credits_text(false);
         let unbundled = super::credits_text(true);
-        assert!(unbundled.starts_with(&bundled));
+        assert!(unbundled.trim_start().starts_with(bundled.trim_start()));
         assert!(unbundled.ends_with("Copyright © 2026 JoKa. MIT License."));
-        assert_eq!(unbundled.lines().count(), 3);
+        assert_eq!(unbundled.lines().count(), 5);
     }
 
     /// The URL part must carry the `NSLink` attribute (clickable); the rest
@@ -197,7 +209,10 @@ mod tests {
     #[test]
     fn project_page_is_a_clickable_link() {
         let credits = super::imp::attributed_credits();
-        let url_index = super::CREDITS_PREFIX.len();
+        let text = credits.string().to_string();
+        let url_index = text
+            .find(super::PROJECT_PAGE)
+            .expect("credits must contain the project page");
         let at_url =
             unsafe { credits.attributesAtIndex_effectiveRange(url_index, std::ptr::null_mut()) };
         let at_text = unsafe { credits.attributesAtIndex_effectiveRange(0, std::ptr::null_mut()) };
