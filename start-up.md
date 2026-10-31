@@ -1,60 +1,47 @@
+<p align="center"><img src="assets/AppIcon-1024.png" width="140" alt="MD-Viewer"></p>
+
 # MD-Viewer
 
-Welcome! This is **start-up.md**, the document shown when MD-Viewer launches.
-
-- Edit this file to make the welcome screen your own.
-- Delete it and MD-Viewer starts with an empty document — no error.
-- It is opened as an untitled document; use **Save As…** to keep changes.
-
-Press **Edit** to change the Markdown; this is the rendered preview —
-via [wgpu](https://wgpu.rs) on Metal.
-
-## Supported formats
-
-Text styles: **bold**, *italic*, ~~strikethrough~~, `inline_code` and a [link](https://egui.rs).
-
-Task list:
-
-- [x] Parsing via pulldown-cmark
-- [x] wgpu rendering on Metal
-- [ ] Write your own notes
-
-1. Ordered item
-2. Another one
-   - nested
-
-> Block quote over two lines
->
-> > Nested!
-
-> [!NOTE]
-> GFM alerts: NOTE / TIP / IMPORTANT / WARNING / CAUTION.
+**Native Markdown editor & viewer for macOS on Apple Silicon.**
 
 ---
 
-### Table (GFM)
+> [!TIP]
+> This is `start-up.md`. Make it yours — or delete it and MD-Viewer starts
+> with an empty document.
 
-| Feature  | Status | Note              |
-| :------- | :----: | ----------------: |
-| Tables   |   ✓    | multi-column      |
-| Math     |   ✓    | typeset with LaTeX |
+## Get started
 
-### Code block
+| Action | Shortcut |
+| :--- | :--- |
+| Open a file | ⌘O |
+| Save / Save as | ⌘S / ⌘⇧S |
+| Edit + live preview | ⌘P |
+| Export PDF | ⌘E |
+| Zoom | ⌘+ / ⌘− / ⌘0 |
+
+Drag a `.md` file onto the window, or double-click one in Finder.
+
+## What's inside
+
+- **CommonMark + GFM** — tables, task lists, footnotes and highlighted code.
+- **Obsidian & Pandoc** — callouts, wiki-links, embeds, front matter and `[TOC]`.
+- **Math & diagrams** — LaTeX typeset in place; Mermaid flowcharts and more.
+- **Safe HTML** — `<details>`, tables with spans, images and inline formatting.
+- **Tabs, split view, click-to-source**, picture viewer, dark & Paper themes.
+
+## A taste of Markdown
 
 ```rust
 fn main() {
-    let x = 42; // comment
-    let msg = String::from("Hello world");
-    println!("{msg}: {x}");
+    println!("Hello, Markdown!");
 }
 ```
 
-### Math & footnotes
+Inline math: $E = mc^2$. A footnote[^1].
 
-Inline: $E = mc^2$; display:
+[^1]: Footnotes are typeset at the end of the document.
 
-$$\int_0^\infty e^{-x}\,dx = 1$$
+---
 
-See footnote[^1].
-
-[^1]: A footnote — typeset cleanly at the end of the PDF.
+Project page: [github.com/JoergKau](https://github.com/JoergKau)
