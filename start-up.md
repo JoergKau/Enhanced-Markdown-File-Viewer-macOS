@@ -1,7 +1,7 @@
-# MD-Viewer — Feature List
+# 🚀 MD-Viewer
 
-A native Markdown editor and viewer for macOS on Apple Silicon, written in Rust
-with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
+---
+> A native Markdown editor and viewer for **macOS on Apple Silicon**, written in Rust with **egui/eframe** (**wgpu** → Metal), **winit** and **pulldown-cmark**.
 
 ## Markdown
 
@@ -15,7 +15,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 | **Code blocks** | language-aware syntax highlighting and a language label. |
 
 > [!NOTE] Editor & preview
-> - Rendered preview by default; **Edit** (⌘P) opens a resizable split view with
+> - Rendered preview by default; **Edit** (⌘⇧P) opens a resizable split view with
 >   the source editor and live preview.
 > - Click any preview block to jump to the matching source line; switching views
 >   keeps the section you were reading or editing.
@@ -34,7 +34,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 > - Close confirmation with **Save / Don't Save / Cancel**; closing the window
 >   saves all dirty tabs.
 > - `start-up.md` is loaded at launch as an untitled document; its relative
->   images (the logo) resolve against its folder. Deleting it starts an empty
+>   images resolve against its folder. Deleting it starts an empty
 >   document.
 
 > [!IMPORTANT] PDF export
@@ -55,7 +55,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 > [!NOTE] Technical
 > - Rust 2024 · eframe/egui 0.37 · wgpu (Metal) · winit 0.30 ·
 >   pulldown-cmark 0.13 · arm64 macOS 11+.
-> - 110 unit/integration tests plus an ignored deep render pass; zero build,
+> - 115 unit/integration tests plus an ignored deep render pass; zero build,
 >   clippy and rustfmt warnings.
 > - `.app` packaging with ad-hoc or Developer ID signing, optional notarization,
 >   and a zipped arm64 release archive with SHA-256 checksum.
