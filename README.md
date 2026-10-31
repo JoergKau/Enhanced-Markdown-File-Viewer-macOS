@@ -132,9 +132,10 @@ cargo run --release
 ```
 
 The published repository is deliberately minimal: the application sources, the
-build script, `README.md`, `LICENSE` and `feature-list.md`. Test documents,
-reference checkouts and build artifacts are not part of the tree. The test
-fixtures are compiled into the test binary, so the suite is self-contained.
+build script, `README.md`, `LICENSE`, `feature-list.md` and `start-up.md`.
+Test documents, reference checkouts and build artifacts are not part of the
+tree. The test fixtures are compiled into the test binary, so the suite is
+self-contained.
 
 The first build compiles the full wgpu/egui stack and can take a few minutes.
 Subsequent builds are incremental.
@@ -144,6 +145,20 @@ For development (faster compile, debug assertions):
 ```bash
 cargo run
 ```
+
+---
+
+## Startup document
+
+MD-Viewer opens `start-up.md` when it launches. The file is loaded at runtime,
+not compiled into the binary:
+
+- **App bundle:** `MD-Viewer.app/Contents/Resources/start-up.md`
+- **`cargo run`:** `start-up.md` in the current working directory
+
+It is opened as an untitled document, so edits require **Save As…** and never
+modify the shipped file. If the file is missing or unreadable, the app starts
+with an empty document — deleting `start-up.md` is always safe.
 
 ---
 
@@ -175,7 +190,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-All tests must pass and there should be zero warnings. The 107 tests cover the
+All tests must pass and there should be zero warnings. The 110 tests cover the
 parser (including HTML block conversion and the extended compatibility
 corpus), the print-HTML renderer (preprocessors, sanitizer, template,
 math/Mermaid image embedding, escape/base64 helpers), the WeasyPrint runner
@@ -374,6 +389,7 @@ MD-Viewer/
 ├── README.md
 ├── LICENSE                   # MIT
 ├── feature-list.md           # feature matrix and limitations
+├── start-up.md               # document shown on launch (runtime-loaded)
 ├── assets/
 │   ├── AppIcon.icns          # bundle icon
 │   └── AppIcon-1024.png      # master, also embedded for the runtime icon

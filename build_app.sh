@@ -98,6 +98,12 @@ if [ -f "assets/AppIcon.icns" ]; then
   ICON_ENTRY='<key>CFBundleIconFile</key><string>AppIcon</string>'
 fi
 
+# Startup document. Optional: if it is missing, the app opens an empty
+# document instead of failing.
+if [ -f "start-up.md" ]; then
+  cp "start-up.md" "$RESOURCES_DIR/start-up.md"
+fi
+
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -270,63 +270,43 @@ const ZOOM_CONTROL_SIZE: Vec2 = Vec2::new(52.0, 24.0);
 // App state
 // ---------------------------------------------------------------------------
 
-/// Demo document shown on first launch. It intentionally exercises every
-/// supported Markdown feature so users (and developers) can verify rendering.
-const SAMPLE_MD: &str = r#"# MD-Viewer
+/// File name of the startup document.
+const STARTUP_FILE: &str = "start-up.md";
 
-Welcome! Press **Edit** to change the Markdown; this is the rendered preview —
-via [wgpu](https://wgpu.rs) on Metal.
-
-## Supported formats
-
-Text styles: **bold**, *italic*, ~~strikethrough~~, `inline_code` and a [link](https://egui.rs).
-
-Task list:
-
-- [x] Parsing via pulldown-cmark
-- [x] wgpu rendering on Metal
-- [ ] Write your own notes
-
-1. Ordered item
-2. Another one
-   - nested
-
-> Block quote over two lines
->
-> > Nested!
-
-> [!NOTE]
-> GFM alerts: NOTE / TIP / IMPORTANT / WARNING / CAUTION.
-
----
-
-### Table (GFM)
-
-| Feature  | Status | Note             |
-| :------- | :----: | ---------------: |
-| Tables   |   ✓    | multi-column     |
-| Math     |   ~    | as LaTeX source  |
-
-### Code block
-
-```rust
-fn main() {
-    let x = 42; // comment
-    let msg = String::from("Hello world");
-    println!("{msg}: {x}");
+/// Loads the startup document shown on launch.
+///
+/// Candidates are checked in order:
+/// 1. `Contents/Resources/start-up.md` inside a `.app` bundle,
+/// 2. `start-up.md` in the current working directory (for `cargo run`).
+///
+/// A missing or unreadable file is **not** an error: the app opens an empty
+/// document instead, so deleting `start-up.md` is always safe.
+fn startup_text() -> String {
+    startup_text_from(&startup_candidates())
 }
-```
 
-### Math & footnotes
+/// Reads the first readable candidate; returns an empty string otherwise.
+fn startup_text_from(candidates: &[PathBuf]) -> String {
+    candidates
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default()
+}
 
-Inline: $E = mc^2$; display:
-
-$$\int_0^\infty e^{-x}\,dx = 1$$
-
-See footnote[^1].
-
-[^1]: A footnote — typeset cleanly at the end of the PDF.
-"#;
+/// Candidate locations for [`STARTUP_FILE`], most specific first.
+fn startup_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(contents) = exe.parent().and_then(Path::parent)
+    {
+        // .app/Contents/MacOS/MD-Viewer → .app/Contents/Resources/start-up.md
+        paths.push(contents.join("Resources").join(STARTUP_FILE));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd.join(STARTUP_FILE));
+    }
+    paths
+}
 
 /// How the document is displayed.
 ///
@@ -832,7 +812,7 @@ impl App {
         install_system_fonts(&cc.egui_ctx);
         crate::macos_open::set_context(cc.egui_ctx.clone());
 
-        let text = SAMPLE_MD.to_string();
+        let text = startup_text();
         let doc = parser::parse(&text);
         let line_count = text.lines().count();
         let word_count = text.split_whitespace().count();
@@ -6575,6 +6555,49 @@ mod render_smoke_tests {
             run_preview(markdown, 1000.0, theme::Mode::Dark);
             run_preview(markdown, 760.0, theme::Mode::Paper);
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mdviewer-startup-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A missing start-up file is not an error: the app opens empty.
+    #[test]
+    fn missing_startup_file_is_not_an_error() {
+        let dir = temp_dir("missing");
+        let path = dir.join(STARTUP_FILE);
+        assert_eq!(startup_text_from(&[path]), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first readable candidate is used.
+    #[test]
+    fn startup_file_is_read_when_present() {
+        let dir = temp_dir("present");
+        let path = dir.join(STARTUP_FILE);
+        std::fs::write(&path, "# Hello\n\nBody.\n").expect("write start-up.md");
+        assert_eq!(startup_text_from(&[path]), "# Hello\n\nBody.\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The published start-up document must parse. If it was deleted, the app
+    /// (and this test) must still work, so the test simply skips.
+    #[test]
+    fn published_startup_document_parses() {
+        let Ok(markdown) = std::fs::read_to_string(STARTUP_FILE) else {
+            return;
+        };
+        let doc = crate::parser::parse(&markdown);
+        assert!(!doc.blocks.is_empty(), "start-up.md produced no blocks");
     }
 }
 
