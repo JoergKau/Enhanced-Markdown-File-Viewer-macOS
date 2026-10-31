@@ -95,8 +95,8 @@ shasum -a 256 -c MD-Viewer-<version>-arm64.zip.sha256
   prompt when closing a dirty document.
 - **Metal-accelerated** rendering via wgpu.
 
-See [feature-list.md](feature-list.md) for the full feature matrix, status
-legend and known limitations.
+See [feature-list.md](feature-list.md) for a concise feature overview and the
+technical characteristics.
 
 ---
 
@@ -388,7 +388,7 @@ MD-Viewer/
 ├── build_app.sh              # .app bundle, signing, zip packaging
 ├── README.md
 ├── LICENSE                   # MIT
-├── feature-list.md           # feature matrix and limitations
+├── feature-list.md           # concise feature overview
 ├── start-up.md               # document shown on launch (runtime-loaded)
 ├── assets/
 │   ├── AppIcon.icns          # bundle icon
