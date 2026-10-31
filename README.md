@@ -45,7 +45,7 @@ shasum -a 256 -c MD-Viewer-<version>-arm64.zip.sha256
 
 - **Complete Markdown** — CommonMark + GFM, tables, task lists, footnotes, callouts, code highlighting and typeset LaTeX math.
 - **Obsidian & Pandoc** — wiki-links, `![[…]]` embeds, front matter, fenced divs, admonitions and `[TOC]`.
-- **Live preview & split editor** — click any preview block to jump to its source line; both views keep your reading position.
+- **Live preview & split editor** — click any preview block to jump to its source line; find & replace and an outline sidebar keep long documents navigable.
 - **Print-quality PDF** — A4, running footer, clickable links, images, math and Mermaid via WeasyPrint.
 - **Native macOS UI** — dark and Paper themes, SF Pro/SF Mono, tabs, drag & drop and native dialogs.
 - **Fast & self-contained** — Metal-accelerated rendering, virtualized large documents, no browser engine.
@@ -146,7 +146,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-All tests must pass and there should be zero warnings. The 110 tests cover the
+All tests must pass and there should be zero warnings. The 115 tests cover the
 parser (including HTML block conversion and the extended compatibility
 corpus), the print-HTML renderer (preprocessors, sanitizer, template,
 math/Mermaid image embedding, escape/base64 helpers), the WeasyPrint runner
@@ -325,8 +325,11 @@ iconutil -c icns AppIcon.iconset -o AppIcon.icns
 | Save | Toolbar **Save**, ⌘S |
 | Save as | ⌘⇧S |
 | Export PDF | Toolbar **Export PDF**, ⌘E. Without WeasyPrint the button is greyed out and opens the setup dialog; the rest of the app works normally |
+| Print | Toolbar **Print**, ⌘P — exports a temporary PDF and opens it in Preview for the system print dialog |
+| Find & replace | Toolbar **Find**, ⌘F; ⌘G / ⇧⌘G next/previous, Esc closes |
+| Outline | Toolbar **Outline**, ⌘⇧O — click a heading to jump to that section |
 | Toggle dark / Paper theme | Toolbar sun/moon button at the right (sun = dark active, moon = Paper active) |
-| Switch view | Toolbar **Preview / Edit**, ⌘P — Edit shows raw text left and live preview right |
+| Switch view | Toolbar **Preview / Edit**, ⌘⇧P — Edit shows raw text left and live preview right |
 | Zoom | Toolbar **A−/A+**, ⌘+/⌘−; the percentage readout between them shows the current magnification and resets to 100% when clicked (also ⌘0) |
 | Inspect an image | Click an image in the preview; scroll to zoom, drag to pan, **Esc** (or **Close**) returns to the document |
 | Cut / copy / paste | ⌘X / ⌘C / ⌘V (Ctrl also works) or right-click in the editor |
