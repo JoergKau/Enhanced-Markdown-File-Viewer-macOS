@@ -2,13 +2,16 @@
 //!
 //! winit installs the standard application menu. Its **About MD-Viewer** item
 //! calls `orderFrontStandardAboutPanel:` on `NSApplication`, which builds the
-//! panel from the bundle's `Info.plist` and shows no extra information.
+//! panel from the bundle's `Info.plist`.
 //!
 //! AppKit has no setter for panel options on macOS — only
 //! `orderFrontStandardAboutPanelWithOptions:`. We therefore swizzle the
 //! no-options method: when the menu item fires, our implementation shows the
-//! same standard panel with a credits block attached. The credits occupy the
-//! bottom of the panel and make AppKit grow it to fit both lines.
+//! same standard panel with explicit options. Passing the name, version and
+//! runtime icon explicitly keeps the panel correct even when the binary runs
+//! outside a `.app` bundle (`cargo run`), where there is no `Info.plist`.
+//! The credits block adds the project lines; it also carries the copyright
+//! when no bundle can supply `NSHumanReadableCopyright`.
 //!
 //! The module is macOS-only and deliberately isolated: no other part of the
 //! app depends on Objective-C.
@@ -19,9 +22,24 @@ const PROJECT_PAGE: &str = "https://github.com/JoergKau";
 /// Prefix before the URL in the credits block (used for the link range).
 const CREDITS_PREFIX: &str = "Enhanced Markdown File Viewer for macOS\nProject Page: ";
 
-/// Credits block. Two lines at the bottom of the standard About panel.
-fn credits_text() -> String {
-    format!("{CREDITS_PREFIX}{PROJECT_PAGE}")
+/// Copyright shown in the credits when no `.app` bundle provides one.
+const COPYRIGHT: &str = "Copyright © 2026 JoKa. MIT License.";
+
+/// Application name shown in the About panel.
+const APP_NAME: &str = "MD-Viewer";
+
+/// Application version shown in the About panel.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Credits block: two project lines, plus the copyright when the binary runs
+/// without a bundle (`cargo run`), where `Info.plist` cannot supply it.
+fn credits_text(with_copyright: bool) -> String {
+    let mut text = format!("{CREDITS_PREFIX}{PROJECT_PAGE}");
+    if with_copyright {
+        text.push('\n');
+        text.push_str(COPYRIGHT);
+    }
+    text
 }
 
 /// Installs the About panel credits. Returns `true` on success.
@@ -33,10 +51,16 @@ pub fn install() -> bool {
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2::ffi::{class_getInstanceMethod, method_setImplementation};
+    use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Imp, Method, Sel};
-    use objc2::{class, msg_send};
-    use objc2_app_kit::NSAboutPanelOptionCredits;
-    use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSRange, NSString, NSURL};
+    use objc2::{Message, class, msg_send};
+    use objc2_app_kit::{
+        NSAboutPanelOptionApplicationIcon, NSAboutPanelOptionApplicationName,
+        NSAboutPanelOptionCredits, NSAboutPanelOptionVersion, NSImage,
+    };
+    use objc2_foundation::{
+        NSBundle, NSDictionary, NSMutableAttributedString, NSRange, NSString, NSURL,
+    };
 
     pub fn install() -> bool {
         // SAFETY: main thread, NSApplication is a singleton. We replace one
@@ -56,19 +80,29 @@ mod imp {
         true
     }
 
+    /// True when the process runs from a `.app` bundle with an `Info.plist`.
+    fn has_bundle() -> bool {
+        NSBundle::mainBundle().bundleIdentifier().is_some()
+    }
+
+    /// Casts any Objective-C object reference to `AnyObject`.
+    unsafe fn as_any<T: Message>(object: &T) -> &AnyObject {
+        unsafe { &*(object as *const T).cast::<AnyObject>() }
+    }
+
     /// Builds the credits text with a clickable link on the project URL.
     ///
     /// `NSLinkAttributeName` is not exposed by objc2-foundation; its raw
     /// value is the string `NSLink`.
-    pub(super) fn attributed_credits() -> objc2::rc::Retained<NSMutableAttributedString> {
-        let text = NSString::from_str(&super::credits_text());
+    pub(super) fn attributed_credits() -> Retained<NSMutableAttributedString> {
+        let text = NSString::from_str(&super::credits_text(!has_bundle()));
         let credits = NSMutableAttributedString::from_nsstring(&text);
 
         let link_key = NSString::from_str("NSLink");
         let url_text = NSString::from_str(super::PROJECT_PAGE);
         if let Some(url) = NSURL::URLWithString(&url_text) {
             // The dictionary/attribute APIs store values as `AnyObject`.
-            let url_object: &AnyObject = unsafe { &*(&*url as *const NSURL).cast::<AnyObject>() };
+            let url_object: &AnyObject = unsafe { as_any(&*url) };
             let range = NSRange::new(super::CREDITS_PREFIX.len(), super::PROJECT_PAGE.len());
             // SAFETY: `NSLink` expects an NSURL value; the range is the exact
             // UTF-16 span of the URL inside the credits string.
@@ -81,18 +115,40 @@ mod imp {
 
     /// Replacement for `orderFrontStandardAboutPanel:`.
     ///
-    /// Shows the standard panel with the project credits attached, so the
-    /// About window grows and ends with the two project lines.
+    /// Shows the standard panel with explicit name, version, runtime icon and
+    /// credits. Supplying the icon matters outside a bundle: the options
+    /// variant otherwise ignores `NSApplication.applicationIconImage`.
     unsafe extern "C-unwind" fn order_front_about(this: *mut AnyObject, _cmd: Sel) {
         log::info!("showing About panel with credits");
-        let credits = attributed_credits();
-        // The options dictionary stores objects as `AnyObject`.
-        let credits_object: &AnyObject =
-            unsafe { &*(&*credits as *const NSMutableAttributedString).cast::<AnyObject>() };
 
-        // SAFETY: `NSAboutPanelOptionCredits` is an AppKit constant.
-        let key: &NSString = unsafe { NSAboutPanelOptionCredits };
-        let options = NSDictionary::from_slices(&[key], &[credits_object]);
+        let name = NSString::from_str(super::APP_NAME);
+        let version = NSString::from_str(super::APP_VERSION);
+        let credits = attributed_credits();
+        // eframe sets the runtime icon from `ViewportBuilder::with_icon`.
+        let icon: Option<Retained<NSImage>> = unsafe { msg_send![this, applicationIconImage] };
+        let bundled = has_bundle();
+
+        let mut keys: Vec<&NSString> = Vec::new();
+        let mut values: Vec<&AnyObject> = Vec::new();
+        // SAFETY: all keys are AppKit constants and all values are the types
+        // those keys expect (NSString, NSAttributedString, NSImage).
+        unsafe {
+            keys.push(NSAboutPanelOptionApplicationName);
+            values.push(as_any(&*name));
+            // Inside a bundle, keep the version strings from Info.plist
+            // (short version + build number); outside, supply them explicitly.
+            if !bundled {
+                keys.push(NSAboutPanelOptionVersion);
+                values.push(as_any(&*version));
+            }
+            keys.push(NSAboutPanelOptionCredits);
+            values.push(as_any(&*credits));
+            if let Some(icon) = icon.as_deref() {
+                keys.push(NSAboutPanelOptionApplicationIcon);
+                values.push(as_any(icon));
+            }
+        }
+        let options = NSDictionary::from_slices(&keys, &values);
 
         let _: () = msg_send![
             this,
@@ -105,9 +161,18 @@ mod imp {
 mod tests {
     #[test]
     fn credits_contain_the_project_page() {
-        let text = super::credits_text();
+        let text = super::credits_text(false);
         assert!(text.contains("Project Page: https://github.com/JoergKau"));
         assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn bundled_and_unbundled_credits_differ_only_by_the_copyright() {
+        let bundled = super::credits_text(false);
+        let unbundled = super::credits_text(true);
+        assert!(unbundled.starts_with(&bundled));
+        assert!(unbundled.ends_with("Copyright © 2026 JoKa. MIT License."));
+        assert_eq!(unbundled.lines().count(), 3);
     }
 
     /// The URL part must carry the `NSLink` attribute (clickable); the rest
