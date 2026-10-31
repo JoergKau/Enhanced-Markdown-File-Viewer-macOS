@@ -43,57 +43,12 @@ shasum -a 256 -c MD-Viewer-<version>-arm64.zip.sha256
 
 ## Highlights
 
-- **Complete Markdown support** — CommonMark + GFM tables, task lists,
-  strikethrough, highlight, footnotes, GFM/Obsidian callouts, super-/subscript,
-  definition lists and typeset LaTeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`).
-- **Obsidian-friendly** — wiki-links, `![[…]]` embeds, comments, properties and
-  callout fold markers.
-- **Live preview** with syntax-highlighted code blocks, images (PNG/JPEG/GIF/
-  WebP/SVG), GFM/HTML tables, native Mermaid diagrams and footnote sections.
-- **Click preview → jump to source** — in split mode, click any rendered block
-  and the editor moves its caret to the matching Markdown line and centers it.
-- **Two-way section sync** — switching between Preview and Edit keeps the
-  section you were reading/editing: the editor follows the preview’s top block,
-  and the preview follows the editor caret.
-- **Encoding & global text** — UTF-8 (with BOM), UTF-16LE/BE and Windows-1252
-  files open correctly; CJK, Arabic and Hebrew glyphs come from macOS system
-  fonts, with run-level bidi reordering for mixed-direction lines.
-- **Local navigation** — relative `.md` links and Obsidian wiki-links/embeds
-  open the target document in a tab instead of leaving the app.
-- **Large documents** — previews above 250 top-level blocks render only the
-  visible window, so reading multi-megabyte files stays responsive.
-- **Tabs** — every file opens in its own tab. The strip only appears with
-  two or more documents and then fills the whole row with equal-width tabs
-  (macOS window-tab style); it shows unsaved dots, supports switching and
-  closing (with a save prompt). ⌘W closes the active tab, and closing down to
-  one document hides the strip again.
-- **Broader Markdown dialects** — Pandoc/Quarto fenced divs, inline notes,
-  citations, heading attributes, grid tables and `[TOC]`; MkDocs admonitions
-  and abbreviations; Obsidian tags, block ids and `![[Note]]` transclusion;
-  YAML/TOML/JSON front matter (nested YAML supported).
-- **Safe HTML & media** — `<details>`, HTML tables/images, styled
-  `<div>`/`<section>` banners, headings, paragraphs, lists, quotes, code and
-  `<kbd>`/`<mark>`/links render; `<video>`/`<audio>`/`<iframe>` become safe
-  labelled cards and inline SVG is rasterized. Scripts never run and CSS is
-  ignored outside the supported subset.
-- **Print-quality PDF export (WeasyPrint)** — the raw Markdown is rendered to
-  sanitized HTML (`html_export.rs`: code/math/emoji/wiki-link/callout
-  preprocessors, `.markdown-body` styles and a running-footer print template,
-  plus our own print fixes) and converted with the `weasyprint` CLI
-  (detected in `PATH` and Homebrew locations): real A4 pagination with
-  running footers, selectable text with Unicode font fallback, clickable link
-  annotations, embedded local images (base64 data URIs), typeset LaTeX math
-  and Mermaid diagrams (embedded images), and styled tables, code blocks and
-  callout cards. WeasyPrint is **mandatory** — if it is missing or fails,
-  export reports an error (no fallback writer), and the app offers a one-click
-  install hint at launch.
-- **Native macOS UI** — dark slate/charcoal theme by default, with a one-click
-  **Paper** light theme (warm off-white, not bright white) via the sun/moon
-  button in the toolbar. Typography is fixed — **SF Pro** (San Francisco),
-  Apple's system font, for text and **SF Mono** for code; there is no font
-  picker. Native file dialogs, drag & drop, ⌘ shortcuts, and a save-changes
-  prompt when closing a dirty document.
-- **Metal-accelerated** rendering via wgpu.
+- **Complete Markdown** — CommonMark + GFM, tables, task lists, footnotes, callouts, code highlighting and typeset LaTeX math.
+- **Obsidian & Pandoc** — wiki-links, `![[…]]` embeds, front matter, fenced divs, admonitions and `[TOC]`.
+- **Live preview & split editor** — click any preview block to jump to its source line; both views keep your reading position.
+- **Print-quality PDF** — A4, running footer, clickable links, images, math and Mermaid via WeasyPrint.
+- **Native macOS UI** — dark and Paper themes, SF Pro/SF Mono, tabs, drag & drop and native dialogs.
+- **Fast & self-contained** — Metal-accelerated rendering, virtualized large documents, no browser engine.
 
 See [feature-list.md](feature-list.md) for a concise feature overview and the
 technical characteristics.
