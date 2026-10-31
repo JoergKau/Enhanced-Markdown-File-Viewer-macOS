@@ -29,6 +29,7 @@
 //!   mandatory — failures are reported as errors, no fallback writer.
 //! * [`encoding`] decodes UTF-8/UTF-16/legacy files before parsing.
 //! * [`macos_open`] integrates the Finder "Open With" Apple Events.
+//! * [`macos_about`] adds the project credits to the standard About panel.
 //!
 //! ## Data flow
 //!
@@ -61,6 +62,8 @@
 mod encoding;
 mod export;
 mod html_export;
+#[cfg(target_os = "macos")]
+mod macos_about;
 mod macos_open;
 mod parser;
 #[cfg(test)]
@@ -87,6 +90,11 @@ fn main() {
     // loop starts, so cold-start "Open With" launches are not lost.
     #[cfg(target_os = "macos")]
     macos_open::install_early();
+
+    // Add the project credits to the standard "About MD-Viewer" panel. The
+    // credits block also makes AppKit grow the panel to fit both lines.
+    #[cfg(target_os = "macos")]
+    macos_about::install();
 
     // On Apple Silicon: HighPerformance selects the more capable GPU.
     // (On machines with only an integrated GPU this is a no-op.)
