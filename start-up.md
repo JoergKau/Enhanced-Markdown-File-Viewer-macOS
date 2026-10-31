@@ -1,7 +1,7 @@
-> [!TIP] MD-Viewer — Feature List
->
-> A native Markdown editor and viewer for macOS on Apple Silicon, written in Rust
-> with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
+# MD-Viewer — Feature List
+
+A native Markdown editor and viewer for macOS on Apple Silicon, written in Rust
+with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 ## Markdown
 
