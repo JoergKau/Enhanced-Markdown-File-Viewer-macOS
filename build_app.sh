@@ -31,6 +31,8 @@ APP_NAME="MD-Viewer"
 BIN_NAME="md_viewer"
 BUNDLE_ID="${BUNDLE_ID:-com.kauschke.mdviewer}"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+# Build number shown as "Version <short> (<build>)" in the About panel.
+BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
 INSTALL=0
 PACKAGE=0
@@ -104,7 +106,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>$APP_NAME</string>
