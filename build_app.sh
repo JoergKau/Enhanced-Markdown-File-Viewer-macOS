@@ -104,11 +104,6 @@ if [ -f "start-up.md" ]; then
   cp "start-up.md" "$RESOURCES_DIR/start-up.md"
 fi
 
-# The startup document references the logo relative to its own folder.
-if [ -f "assets/AppIcon-1024.png" ]; then
-  mkdir -p "$RESOURCES_DIR/assets"
-  cp "assets/AppIcon-1024.png" "$RESOURCES_DIR/assets/AppIcon-1024.png"
-fi
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

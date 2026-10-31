@@ -6612,12 +6612,9 @@ mod startup_tests {
         assert!(
             doc.blocks.iter().any(|block| matches!(
                 block,
-                Block::Image {
-                    image: Inline::Image { url, .. },
-                    center: true
-                } if url.contains("AppIcon-1024.png")
+                Block::BlockQuote { title: Some(title), .. } if title.contains("Feature List")
             )),
-            "start-up.md should start with the centered app logo"
+            "start-up.md should start with the feature-list callout title"
         );
     }
 }

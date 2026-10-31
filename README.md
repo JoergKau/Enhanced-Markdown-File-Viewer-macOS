@@ -158,10 +158,8 @@ not compiled into the binary:
 
 It is opened as an untitled document, so edits require **Save As…** and never
 modify the shipped file. Relative images and links resolve against the file's
-own folder, so the logo (`assets/AppIcon-1024.png`) works both in the
-repository and in the bundle (`Contents/Resources/assets/AppIcon-1024.png`).
-If the file is missing or unreadable, the app starts with an empty document —
-deleting `start-up.md` is always safe.
+own folder. If the file is missing or unreadable, the app starts with an empty
+document — deleting `start-up.md` is always safe.
 
 ---
 
