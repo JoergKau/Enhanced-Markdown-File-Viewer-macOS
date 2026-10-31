@@ -182,7 +182,7 @@ embedded images.
 | High-performance GPU | ✅ | wgpu `PowerPreference::HighPerformance`. |
 | Status toasts | ✅ | Success/error messages auto-hide after ~4 seconds. |
 | Keyboard shortcuts | ✅ | See table below. |
-| About panel | ✅ | **MD-Viewer → About MD-Viewer** shows the standard panel, grown to fit a two-line credits block at the bottom: *Enhanced Markdown File Viewer for macOS* and *Project Page: https://github.com/JoergKau*. Implemented by swizzling `orderFrontStandardAboutPanel:` so the menu item opens the options variant. |
+| About panel | ✅ | **MD-Viewer → About MD-Viewer** shows the standard panel, grown to fit a two-line credits block at the bottom: *Enhanced Markdown File Viewer for macOS* and a **clickable** *Project Page: https://github.com/JoergKau* (the URL carries an `NSLink` attribute and opens in the default browser). Implemented by swizzling `orderFrontStandardAboutPanel:` so the menu item opens the options variant. |
 
 ### Keyboard shortcuts
 
@@ -222,7 +222,7 @@ embedded images.
 | External runtime dependencies | WeasyPrint (`brew install weasyprint`) is required for PDF export; the app shows an onboarding dialog with the command when it is missing. The editor and preview need no external runtime (remote images use the system `curl`). |
 | Target platform | macOS 11+ on Apple Silicon (arm64) only; Intel is not supported |
 | Distribution | `build_app.sh` creates the `.app` bundle, signs it (ad-hoc locally, Developer ID + hardened runtime when configured), optionally notarizes and staples it, and writes a zipped arm64 release archive with a SHA-256 checksum. |
-| Test coverage | 105 unit/integration tests + 1 ignored deep test: parser (CommonMark/GFM, tight/loose lists, nested inline styles, HTML `<sub>`/`<sup>`, HTML block conversion, the extended compatibility corpus, tables with spans, math incl. row breaks, Mermaid, wiki-links, footnotes), print HTML (preprocessors, sanitizer, template, base64, escaping, callout/fence ordering, typeset math and Mermaid images), WeasyPrint runner (missing/failing binary, real end-to-end export when installed), dark/Paper palettes, tabs (labels, switching, edit preservation, closing), encoding detection (BOM/UTF-16/legacy), bidi run ordering, link resolution, preview virtualization, Pandoc/MkDocs/Obsidian extensions, front matter formats, media/SVG handling, compiled-in test fixtures, picture-viewer logic, magnification readout, LaTeX texture rendering |
+| Test coverage | 106 unit/integration tests + 1 ignored deep test: parser (CommonMark/GFM, tight/loose lists, nested inline styles, HTML `<sub>`/`<sup>`, HTML block conversion, the extended compatibility corpus, tables with spans, math incl. row breaks, Mermaid, wiki-links, footnotes), print HTML (preprocessors, sanitizer, template, base64, escaping, callout/fence ordering, typeset math and Mermaid images), WeasyPrint runner (missing/failing binary, real end-to-end export when installed), dark/Paper palettes, tabs (labels, switching, edit preservation, closing), encoding detection (BOM/UTF-16/legacy), bidi run ordering, link resolution, preview virtualization, Pandoc/MkDocs/Obsidian extensions, front matter formats, media/SVG handling, compiled-in test fixtures, picture-viewer logic, magnification readout, LaTeX texture rendering |
 | Warnings | Zero `cargo build` warnings, zero `cargo clippy` warnings |
 
 ---
