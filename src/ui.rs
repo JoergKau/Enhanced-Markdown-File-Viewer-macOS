@@ -273,24 +273,28 @@ const ZOOM_CONTROL_SIZE: Vec2 = Vec2::new(52.0, 24.0);
 /// File name of the startup document.
 const STARTUP_FILE: &str = "start-up.md";
 
-/// Loads the startup document shown on launch.
+/// Loads the startup document and the folder it came from.
 ///
 /// Candidates are checked in order:
 /// 1. `Contents/Resources/start-up.md` inside a `.app` bundle,
 /// 2. `start-up.md` in the current working directory (for `cargo run`).
 ///
-/// A missing or unreadable file is **not** an error: the app opens an empty
-/// document instead, so deleting `start-up.md` is always safe.
-fn startup_text() -> String {
-    startup_text_from(&startup_candidates())
+/// The folder is used to resolve relative images and links in the startup
+/// document (for example its logo). A missing or unreadable file is **not** an
+/// error: the app opens an empty document instead, so deleting `start-up.md`
+/// is always safe.
+fn startup_document() -> (String, Option<PathBuf>) {
+    startup_document_from(&startup_candidates())
 }
 
-/// Reads the first readable candidate; returns an empty string otherwise.
-fn startup_text_from(candidates: &[PathBuf]) -> String {
-    candidates
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .unwrap_or_default()
+/// Reads the first readable candidate and returns its folder.
+fn startup_document_from(candidates: &[PathBuf]) -> (String, Option<PathBuf>) {
+    for path in candidates {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return (text, path.parent().map(Path::to_path_buf));
+        }
+    }
+    (String::new(), None)
 }
 
 /// Candidate locations for [`STARTUP_FILE`], most specific first.
@@ -736,6 +740,9 @@ pub struct App {
     pub doc: parser::Document,
     /// Currently open file.
     pub path: Option<PathBuf>,
+    /// Folder of the startup document, used to resolve its relative images
+    /// and links. `None` when no startup document was found.
+    startup_base: Option<PathBuf>,
     /// Unsaved changes.
     pub dirty: bool,
     /// All open tabs. The active slot is a snapshot from the last switch; its
@@ -812,7 +819,7 @@ impl App {
         install_system_fonts(&cc.egui_ctx);
         crate::macos_open::set_context(cc.egui_ctx.clone());
 
-        let text = startup_text();
+        let (text, startup_base) = startup_document();
         let doc = parser::parse(&text);
         let line_count = text.lines().count();
         let word_count = text.split_whitespace().count();
@@ -821,6 +828,7 @@ impl App {
             text,
             doc,
             path: None,
+            startup_base,
             dirty: false,
             tabs: Vec::new(),
             active_tab: 0,
@@ -850,6 +858,16 @@ impl App {
             app.open_path_in_current_tab(path);
         }
         app
+    }
+
+    /// Folder used to resolve relative images and links for the active
+    /// document. While the startup document is untitled, its own folder is
+    /// used so the logo and other relative assets still resolve.
+    fn base_dir(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| self.startup_base.clone())
     }
 
     // ---------------- Tabs ----------------
@@ -1217,10 +1235,7 @@ impl App {
         else {
             return;
         };
-        let base_dir = self
-            .path
-            .as_ref()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let base_dir = self.base_dir();
         match crate::export::export_pdf(&self.text, base_dir.as_deref(), self.path.as_deref(), &p) {
             Ok(path) => self.set_status(format!("PDF exported: {}", path.display()), false),
             Err(e) => self.set_status(format!("PDF export failed: {e}"), true),
@@ -1576,10 +1591,7 @@ impl App {
                 let inner_right = (right_w - 48.0).max(0.0);
 
                 let f = self.font_size;
-                let base_dir = self
-                    .path
-                    .as_ref()
-                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let base_dir = self.base_dir();
                 let doc = &self.doc;
                 let text = &mut self.text;
                 let last_cursor = &mut self.last_cursor;
@@ -1689,10 +1701,7 @@ impl App {
         egui::CentralPanel::default_margins()
             .frame(Frame::new().fill(palette().bg0))
             .show(ui, |ui| {
-                let base_dir = self
-                    .path
-                    .as_ref()
-                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let base_dir = self.base_dir();
                 let mut image_click = None;
                 let mut source_jump = None;
                 preview_ui(
@@ -6575,7 +6584,7 @@ mod startup_tests {
     fn missing_startup_file_is_not_an_error() {
         let dir = temp_dir("missing");
         let path = dir.join(STARTUP_FILE);
-        assert_eq!(startup_text_from(&[path]), "");
+        assert_eq!(startup_document_from(&[path]), (String::new(), None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6585,7 +6594,9 @@ mod startup_tests {
         let dir = temp_dir("present");
         let path = dir.join(STARTUP_FILE);
         std::fs::write(&path, "# Hello\n\nBody.\n").expect("write start-up.md");
-        assert_eq!(startup_text_from(&[path]), "# Hello\n\nBody.\n");
+        let (text, base) = startup_document_from(&[path]);
+        assert_eq!(text, "# Hello\n\nBody.\n");
+        assert_eq!(base.as_deref(), Some(dir.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6598,6 +6609,16 @@ mod startup_tests {
         };
         let doc = crate::parser::parse(&markdown);
         assert!(!doc.blocks.is_empty(), "start-up.md produced no blocks");
+        assert!(
+            doc.blocks.iter().any(|block| matches!(
+                block,
+                Block::Image {
+                    image: Inline::Image { url, .. },
+                    center: true
+                } if url.contains("AppIcon-1024.png")
+            )),
+            "start-up.md should start with the centered app logo"
+        );
     }
 }
 
@@ -6612,6 +6633,7 @@ mod tab_tests {
             text,
             doc,
             path: None,
+            startup_base: None,
             dirty: false,
             tabs: Vec::new(),
             active_tab: 0,
