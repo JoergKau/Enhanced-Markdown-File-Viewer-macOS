@@ -1,0 +1,18 @@
+# Minimal published tree.
+#
+# Only the application sources, the build script and the three documents below
+# are tracked. Reference checkouts, test documents, local artifacts, build
+# output and OS files stay local and are never published.
+/*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/build_app.sh
+!/README.md
+!/LICENSE
+!/feature-list.md
+!/src/
+!/assets/
+/assets/*
+!/assets/AppIcon-1024.png
+!/assets/AppIcon.icns
