@@ -330,6 +330,13 @@ enum ViewMode {
     Editor,
 }
 
+/// A PDF export running on a worker thread, see [`App::start_export`].
+struct ExportJob {
+    result: std::sync::mpsc::Receiver<std::io::Result<PathBuf>>,
+    /// The PDF is opened in the print dialog instead of being reported as saved.
+    print: bool,
+}
+
 /// A pending caret move for the source editor, see [`App::jump_line`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EditorJump {
@@ -567,6 +574,7 @@ struct TabState {
     text: String,
     doc: parser::Document,
     path: Option<PathBuf>,
+    encoding: crate::encoding::TextEncoding,
     dirty: bool,
     line_count: usize,
     word_count: usize,
@@ -583,6 +591,7 @@ impl TabState {
             doc: parser::parse(&text),
             text,
             path,
+            encoding: crate::encoding::TextEncoding::Utf8,
             dirty: false,
             line_count,
             word_count,
@@ -704,7 +713,7 @@ fn render_transclusion(
     let doc = match cached {
         Some(doc) => doc,
         None => {
-            let Ok(text) = crate::encoding::read_text(path) else {
+            let Ok((text, _)) = crate::encoding::read_text(path) else {
                 return;
             };
             let doc = Arc::new(parser::parse(&text));
@@ -801,6 +810,8 @@ pub struct App {
     doc: parser::Document,
     /// Currently open file.
     path: Option<PathBuf>,
+    /// Encoding the open file was read with; saves write it back.
+    encoding: crate::encoding::TextEncoding,
     /// Folder of the startup document, used to resolve its relative images
     /// and links. `None` when no startup document was found.
     startup_base: Option<PathBuf>,
@@ -834,6 +845,8 @@ pub struct App {
     font_size: f32,
     /// Status toast: (text, is_error, timestamp).
     status: Option<(String, bool, Instant)>,
+    /// PDF export or print running on a worker thread.
+    export_job: Option<ExportJob>,
     /// Cached statistics.
     line_count: usize,
     word_count: usize,
@@ -904,6 +917,7 @@ impl App {
             text,
             doc,
             path: None,
+            encoding: crate::encoding::TextEncoding::Utf8,
             startup_base,
             dirty: false,
             tabs: Vec::new(),
@@ -923,6 +937,7 @@ impl App {
             split_fraction: 0.5,
             font_size: DEFAULT_FONT_SIZE,
             status: None,
+            export_job: None,
             line_count,
             word_count,
             last_cursor: (1, 1),
@@ -965,6 +980,7 @@ impl App {
             text: self.text.clone(),
             doc: self.doc.clone(),
             path: self.path.clone(),
+            encoding: self.encoding,
             dirty: self.dirty,
             line_count: self.line_count,
             word_count: self.word_count,
@@ -990,6 +1006,7 @@ impl App {
         self.text = tab.text;
         self.doc = tab.doc;
         self.path = tab.path;
+        self.encoding = tab.encoding;
         self.dirty = tab.dirty;
         self.line_count = tab.line_count;
         self.word_count = tab.word_count;
@@ -1113,9 +1130,10 @@ impl App {
     fn open_path_in_current_tab(&mut self, path: PathBuf) {
         log::info!("opening {}", path.display());
         match crate::encoding::read_text(&path) {
-            Ok(text) => {
+            Ok((text, encoding)) => {
                 self.text = text;
                 self.path = Some(path.clone());
+                self.encoding = encoding;
                 self.dirty = false;
                 self.jump_line = None;
                 self.preview_line = None;
@@ -1252,9 +1270,12 @@ impl App {
         }
         log::info!("opening {} in a new tab", path.display());
         match crate::encoding::read_text(&path) {
-            Ok(text) => {
+            Ok((text, encoding)) => {
                 self.store_active();
-                let tab = TabState::from_text(text, Some(path.clone()));
+                let tab = TabState {
+                    encoding,
+                    ..TabState::from_text(text, Some(path.clone()))
+                };
                 // The placeholder is overwritten when the tab is stored again.
                 self.tabs.push(TabState::default());
                 self.active_tab = self.tabs.len() - 1;
@@ -1281,9 +1302,26 @@ impl App {
 
     /// Writes the buffer to `path` and makes it the document's path.
     fn write_document(&mut self, path: &Path) -> bool {
-        match std::fs::write(path, self.text.as_bytes()) {
+        // Write the file back in the encoding it was read with. Text that the
+        // encoding cannot represent is saved as UTF-8, and the user is told.
+        let (bytes, fallback_from) = match crate::encoding::encode(&self.text, self.encoding) {
+            Some(bytes) => (bytes, None),
+            None => {
+                let original = self.encoding.label();
+                self.encoding = crate::encoding::TextEncoding::Utf8;
+                (self.text.as_bytes().to_vec(), Some(original))
+            }
+        };
+        match std::fs::write(path, bytes) {
             Ok(()) => {
-                self.set_status(format!("Saved: {}", path.display()), false);
+                if let Some(original) = fallback_from {
+                    self.set_status(
+                        format!("Saved as UTF-8: {original} cannot represent every character."),
+                        true,
+                    );
+                } else {
+                    self.set_status(format!("Saved: {}", path.display()), false);
+                }
                 self.path = Some(path.to_path_buf());
                 self.dirty = false;
                 true
@@ -1350,10 +1388,72 @@ impl App {
         else {
             return;
         };
+        self.start_export(p, false);
+    }
+
+    /// Runs the PDF export on a worker thread, so the window keeps responding
+    /// while WeasyPrint works. [`App::poll_export`] collects the result.
+    fn start_export(&mut self, target: PathBuf, print: bool) {
+        if self.export_job.is_some() {
+            self.set_status("An export is already running.", false);
+            return;
+        }
+        let markdown = self.text.clone();
         let base_dir = self.base_dir();
-        match crate::export::export_pdf(&self.text, base_dir.as_deref(), self.path.as_deref(), &p) {
-            Ok(path) => self.set_status(format!("PDF exported: {}", path.display()), false),
-            Err(e) => self.set_status(format!("PDF export failed: {e}"), true),
+        let source = self.path.clone();
+        let (sender, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = crate::export::export_pdf(
+                &markdown,
+                base_dir.as_deref(),
+                source.as_deref(),
+                &target,
+            );
+            let _ = sender.send(outcome);
+        });
+        self.export_job = Some(ExportJob { result, print });
+        let message = if print {
+            "Preparing print…"
+        } else {
+            "Exporting PDF…"
+        };
+        self.set_status(message, false);
+    }
+
+    /// Collects a finished export and reports it. A finished print opens the
+    /// macOS print dialog here, on the main thread.
+    fn poll_export(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.export_job.as_ref() else {
+            return;
+        };
+        let print = job.print;
+        let outcome = match job.result.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(std::io::Error::other("the export stopped unexpectedly"))
+            }
+        };
+        self.export_job = None;
+        match (print, outcome) {
+            (false, Ok(path)) => {
+                self.set_status(format!("PDF exported: {}", path.display()), false)
+            }
+            (false, Err(e)) => self.set_status(format!("PDF export failed: {e}"), true),
+            (true, Ok(path)) => {
+                #[cfg(target_os = "macos")]
+                {
+                    match crate::macos_print::print_pdf(&path) {
+                        Ok(true) => self.set_status("Print dialog opened.", false),
+                        Ok(false) => self.set_status("Print cancelled.", false),
+                        Err(e) => self.set_status(format!("Print failed: {e}"), true),
+                    }
+                }
+            }
+            (true, Err(e)) => self.set_status(format!("Print failed: {e}"), true),
         }
     }
 
@@ -1368,7 +1468,6 @@ impl App {
             return;
         }
         remove_stale_print_files(&std::env::temp_dir(), Duration::from_secs(60 * 60));
-        let base_dir = self.base_dir();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1377,21 +1476,7 @@ impl App {
             "md-viewer-print-{}-{stamp}.pdf",
             std::process::id()
         ));
-        match crate::export::export_pdf(&self.text, base_dir.as_deref(), self.path.as_deref(), &pdf)
-        {
-            Ok(path) => {
-                #[cfg(target_os = "macos")]
-                {
-                    let result = crate::macos_print::print_pdf(&path);
-                    match result {
-                        Ok(true) => self.set_status("Print dialog opened.", false),
-                        Ok(false) => self.set_status("Print cancelled.", false),
-                        Err(e) => self.set_status(format!("Print failed: {e}"), true),
-                    }
-                }
-            }
-            Err(e) => self.set_status(format!("Print failed: {e}"), true),
-        }
+        self.start_export(pdf, true);
     }
 
     /// Re-checks the mandatory WeasyPrint CLI and updates the toolbar state.
@@ -5737,6 +5822,10 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
             "=https,http",
             "--max-filesize",
             max_bytes.as_str(),
+            // Report the URL after redirects on stderr, so a redirect to a
+            // local address is refused as well.
+            "--write-out",
+            "%{stderr}%{url_effective}",
             "--",
         ])
         .arg(url)
@@ -5751,6 +5840,10 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
         } else {
             format!("curl: {detail}")
         });
+    }
+    let final_url = String::from_utf8_lossy(&output.stderr);
+    if is_local_host(final_url.trim()) {
+        return Err("redirected to an address on this machine".into());
     }
     check_download_limits(&output.stdout)?;
     let data: Arc<[u8]> = output.stdout.into();
@@ -7058,6 +7151,7 @@ impl eframe::App for App {
         }
         self.handle_dropped_files(&ctx);
         self.handle_macos_open();
+        self.poll_export(&ctx);
         self.sync_window_title(&ctx);
 
         self.toolbar(ui);
@@ -7348,6 +7442,7 @@ mod tab_tests {
             text,
             doc,
             path: None,
+            encoding: crate::encoding::TextEncoding::Utf8,
             startup_base: None,
             dirty: false,
             tabs: Vec::new(),
@@ -7367,6 +7462,7 @@ mod tab_tests {
             split_fraction: 0.5,
             font_size: DEFAULT_FONT_SIZE,
             status: None,
+            export_job: None,
             line_count: 2,
             word_count: 2,
             last_cursor: (1, 1),
@@ -7421,6 +7517,53 @@ mod tab_tests {
         app.close_tab(0);
         assert_eq!(app.tabs.len(), 1);
         assert!(!app.tab_bar_visible());
+    }
+
+    #[test]
+    fn export_runs_on_a_worker_and_reports_back() {
+        let target =
+            std::env::temp_dir().join(format!("md-viewer-async-test-{}.pdf", std::process::id()));
+        let mut app = test_app();
+        app.text = "# Hello\n".into();
+        let ctx = egui::Context::default();
+        app.start_export(target.clone(), false);
+        assert!(app.export_job.is_some());
+        app.start_export(target.clone(), false);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(msg, _, _)| msg.contains("already running"))
+        );
+        for _ in 0..500 {
+            app.poll_export(&ctx);
+            if app.export_job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.export_job.is_none(), "the export did not finish");
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn saving_writes_back_the_original_encoding() {
+        let path = temp_file("cp1252-roundtrip", "");
+        let mut app = test_app();
+        app.text = "café\n".into();
+        app.encoding = crate::encoding::TextEncoding::Windows1252;
+        assert!(app.write_document(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n");
+        assert_eq!(app.encoding, crate::encoding::TextEncoding::Windows1252);
+
+        app.text = "中文\n".into();
+        assert!(app.write_document(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), "中文\n".as_bytes());
+        assert_eq!(app.encoding, crate::encoding::TextEncoding::Utf8);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(msg, _, _)| msg.contains("Windows-1252"))
+        );
     }
 
     #[test]
