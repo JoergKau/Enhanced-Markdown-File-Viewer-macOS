@@ -18,7 +18,6 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 regex = "1"
 ammonia = "4"
 rfd = "0.16"
-winit = "0.30"
 tl = "0.7.8"
 encoding_rs = "0.8.35"
 unicode-bidi = "0.3.18"

@@ -1,9 +1,9 @@
 //! # MD-Viewer — native Markdown editor & viewer for macOS (Apple Silicon)
 //!
-//! A lean desktop application written entirely in Rust with a live preview
-//! and PDF export. No external runtime dependencies are required — the
-//! binary is self-contained; the WeasyPrint CLI is the single, mandatory PDF
-//! conversion step (no fallback writer).
+//! A lean desktop application written in Rust with a live preview and PDF
+//! export. The binary itself is self-contained, but PDF export depends on
+//! one external tool: the WeasyPrint CLI (`brew install weasyprint`). It is
+//! mandatory, with no fallback writer.
 //!
 //! ## Architecture at a glance
 //!
@@ -25,8 +25,8 @@
 //! * [`html_export`] renders the raw Markdown source as print-ready HTML
 //!   (based on the reference implementation's pipeline: preprocessors, sanitizer, print
 //!   template with `.markdown-body` CSS, plus typeset math and Mermaid images).
-//! * [`export`] invokes the `weasyprint` CLI on that HTML; WeasyPrint is
-//!   mandatory — failures are reported as errors, no fallback writer.
+//! * [`export`] invokes the `weasyprint` CLI on that HTML and writes the PDF
+//!   only on success; a missing or failing WeasyPrint is reported as an error.
 //! * [`encoding`] decodes UTF-8/UTF-16/legacy files before parsing.
 //! * [`macos_open`] integrates the Finder "Open With" Apple Events.
 //! * [`macos_about`] adds the project credits to the standard About panel.
@@ -68,6 +68,7 @@ mod macos_open;
 #[cfg(target_os = "macos")]
 mod macos_print;
 mod parser;
+mod svg;
 #[cfg(test)]
 mod test_fixtures;
 mod ui;

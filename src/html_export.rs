@@ -5,13 +5,18 @@
 //!
 //! ```text
 //! Markdown
-//!   ├─ protect fenced code blocks / inline code with placeholders
-//!   ├─ strip YAML frontmatter
-//!   ├─ preprocess math ($…$ / $$…$$ → styled spans)
+//!   ├─ normalise CRLF, expand footnotes / admonitions / grid tables / abbreviations
+//!   ├─ protect fenced code blocks with placeholders
+//!   ├─ Pandoc fenced divs, media embeds → HTML
+//!   ├─ strip YAML frontmatter, heading attributes, [TOC] → HTML contents list
+//!   ├─ protect inline code with placeholders
+//!   ├─ preprocess math ($…$ / $$…$$ → typeset PNG images)
 //!   ├─ preprocess emoji shortcodes (:rocket:)
-//!   ├─ preprocess wikilinks ([[Note|Label]] → Markdown links)
-//!   ├─ preprocess callouts (> [!NOTE] → styled <div class="callout">)
-//!   ├─ resolve local image paths → base64 data URIs (needs base_dir)
+//!   ├─ preprocess wikilinks and wiki embeds ([[Note|Label]] → Markdown links)
+//!   ├─ preprocess callouts (> [!NOTE] → styled HTML blocks)
+//!   ├─ inline tags (#tag) and citations ([@key]), inline <svg> → PNG images
+//!   ├─ resolve local images (![]() and <img src>) → base64 data URIs (needs base_dir)
+//!   ├─ restore inline code; Mermaid fences → PNG images
 //!   ├─ pulldown-cmark push_html (GFM | TABLES | TASKLISTS | FOOTNOTES)
 //!   └─ ammonia sanitize (script removed, tables/img/details kept)
 //!        └─ wrap in the print template (the reference implementation's +
@@ -21,13 +26,13 @@
 //!
 //! The preprocessors, sanitizer, template and print CSS are ported from
 //! the reference implementation, with deliberate improvements: WeasyPrint is mandatory (no
-//! fallback writer), callouts emit a trailing blank line so a following block
-//! is parsed normally, math is typeset to PNGs, Mermaid fences are rendered
-//! to PNGs, and display math may span lines.
+//! fallback writer), callouts keep their body as Markdown, math and Mermaid
+//! diagrams are typeset to PNGs, and display math may span lines.
 
 use ammonia::Builder as SanitizerBuilder;
-use regex::Regex;
+use regex::{Captures, Regex};
 use std::path::Path;
+use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
 // Emoji shortcodes (ported from the reference implementation lib.rs)
@@ -104,17 +109,18 @@ fn emoji_map() -> &'static [(&'static str, char)] {
 /// Preprocess emoji shortcodes (`:emoji:`) into unicode characters.
 /// (Ported 1:1 from the reference implementation.)
 fn preprocess_emojis(markdown: &str) -> String {
-    let re = Regex::new(r":([a-z0-9_+-]+):").unwrap();
-    re.replace_all(markdown, |caps: &regex::Captures| {
-        let key = &caps[1];
-        for (k, v) in emoji_map() {
-            if *k == key {
-                return v.to_string();
+    static EMOJI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":([a-z0-9_+-]+):").unwrap());
+    EMOJI_RE
+        .replace_all(markdown, |caps: &Captures| {
+            let key = &caps[1];
+            for (k, v) in emoji_map() {
+                if *k == key {
+                    return v.to_string();
+                }
             }
-        }
-        caps[0].to_string() // no match, keep original
-    })
-    .into_owned()
+            caps[0].to_string() // no match, keep original
+        })
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -142,8 +148,11 @@ fn math_img(tex: &str, display: bool, font: &latex_rust::MathFont) -> Option<(St
     options.display = display;
 
     let png = latex_rust::latex_to_png(&source, font, &options).ok()?;
-    let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok()?;
-    let width_css = (img.width() as f32 * 96.0 / DPI as f32).round().max(1.0) as u32;
+    let (width, _) =
+        image::ImageReader::with_format(std::io::Cursor::new(&png), image::ImageFormat::Png)
+            .into_dimensions()
+            .ok()?;
+    let width_css = (width as f32 * 96.0 / DPI as f32).round().max(1.0) as u32;
     Some((
         format!("data:image/png;base64,{}", base64_encode(&png)),
         width_css,
@@ -181,13 +190,16 @@ fn math_html(tex: &str, display: bool, font: Option<&latex_rust::MathFont>) -> S
 fn preprocess_math(markdown: &str) -> String {
     // Load the math font once per document instead of once per formula.
     let font = latex_rust::MathFont::stix_two_math().ok();
+    static BLOCK_MATH_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)\$\$(.+?)\$\$").unwrap());
+    static INLINE_MATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([^\$]+)\$").unwrap());
+
     let mut result = markdown.to_string();
 
     // Process display math first ($$...$$), replace with placeholders.
-    let block_re = Regex::new(r"(?s)\$\$(.+?)\$\$").unwrap();
     let mut block_placeholders: Vec<(usize, String)> = Vec::new();
     let mut idx = 0usize;
-    let temp = block_re.replace_all(&result, |caps: &regex::Captures| {
+    let temp = BLOCK_MATH_RE.replace_all(&result, |caps: &Captures| {
         let placeholder = format!("\x00BLOCK_MATH_{}\x00", idx);
         block_placeholders.push((idx, math_html(&caps[1], true, font.as_ref())));
         idx += 1;
@@ -196,9 +208,8 @@ fn preprocess_math(markdown: &str) -> String {
     result = temp.into_owned();
 
     // Process inline math ($...$) on the result with placeholders.
-    let inline_re = Regex::new(r"\$([^\$]+)\$").unwrap();
-    result = inline_re
-        .replace_all(&result, |caps: &regex::Captures| {
+    result = INLINE_MATH_RE
+        .replace_all(&result, |caps: &Captures| {
             math_html(&caps[1], false, font.as_ref())
         })
         .into_owned();
@@ -216,10 +227,13 @@ fn preprocess_math(markdown: &str) -> String {
 // Callout preprocessing (ported)
 // ---------------------------------------------------------------------------
 
-/// Preprocess GitHub-style callouts (`[!TYPE]`) into styled HTML divs.
-/// (Based on the reference implementation; emits the required trailing blank line.)
+/// Preprocess GitHub/Obsidian-style callouts (`[!TYPE]`, `+`/`-` fold markers)
+/// into styled HTML blocks. The body stays Markdown, separated from the
+/// block-level HTML by blank lines (as in [`preprocess_fenced_divs_html`]).
+/// (Based on the reference implementation.)
 fn preprocess_callouts(markdown: &str) -> String {
-    let header_re = Regex::new(r"^> \[!(\w+)](\+)?(?:\s+(.*))?$").unwrap();
+    static CALLOUT_HEADER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^> \[!(\w+)]([+-])?(?:\s+(.*))?$").unwrap());
 
     let lines: Vec<&str> = markdown.lines().collect();
     let mut result = String::new();
@@ -227,19 +241,20 @@ fn preprocess_callouts(markdown: &str) -> String {
 
     while i < lines.len() {
         let line = lines[i];
-        if let Some(cap) = header_re.captures(line) {
+        if let Some(cap) = CALLOUT_HEADER_RE.captures(line) {
             let kind = cap[1].to_lowercase();
-            let foldable = cap.get(2).is_some();
+            let fold = cap.get(2).map(|m| m.as_str());
             let title = cap
                 .get(3)
                 .map(|m| m.as_str().trim().to_string())
                 .unwrap_or_default();
-            let mut summary = kind
-                .chars()
+            let mut chars = kind.chars();
+            let mut summary: String = chars
                 .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or(kind.clone())
-                + &kind[1..];
+                .into_iter()
+                .flat_map(char::to_uppercase)
+                .collect();
+            summary.push_str(chars.as_str());
             if !title.is_empty() {
                 summary = encode_safe(&title);
             }
@@ -258,24 +273,29 @@ fn preprocess_callouts(markdown: &str) -> String {
                     break;
                 }
             }
-            let content = content_lines.join("\n");
+            let body = content_lines.join("\n");
 
-            if foldable {
-                result.push_str(&format!(
-                    "<details class=\"callout {}\" open=\"open\"><summary>{}</summary><p>{}</p></details>",
-                    kind, summary, content
-                ));
-            } else {
-                result.push_str(&format!(
-                    "<div class=\"callout {}\"><p><strong>{}</strong></p><p>{}</p></div>",
-                    kind, summary, content
-                ));
-            }
-            // Deliberate fix over the reference implementation: the emitted HTML block must be
-            // followed by a blank line, otherwise CommonMark keeps consuming
-            // the following block (e.g. a fenced code block) as raw HTML and
-            // it is rendered as literal text.
-            result.push_str("\n\n");
+            let (open, close) = match fold {
+                Some("+") => (
+                    format!(
+                        "<details class=\"callout {kind}\" open=\"open\"><summary>{summary}</summary>"
+                    ),
+                    "</details>",
+                ),
+                Some(_) => (
+                    format!("<details class=\"callout {kind}\"><summary>{summary}</summary>"),
+                    "</details>",
+                ),
+                None => (
+                    format!("<div class=\"callout {kind}\">\n\n<p><strong>{summary}</strong></p>"),
+                    "</div>",
+                ),
+            };
+            // Blank lines around the body let it parse as Markdown. The block
+            // also needs a trailing blank line, otherwise CommonMark keeps
+            // consuming the following block (e.g. a fenced code block) as raw
+            // HTML and it is rendered as literal text.
+            result.push_str(&format!("{open}\n\n{body}\n\n{close}\n\n"));
             continue;
         }
         result.push_str(line);
@@ -292,37 +312,53 @@ fn preprocess_callouts(markdown: &str) -> String {
 
 /// Preprocess wikilinks (`[[link]]`) into standard Markdown links.
 /// Supports: `[[Page]]`, `[[#Heading]]`, `[[Page#Heading]]`, `[[Page|Display]]`.
-/// (Ported 1:1 from the reference implementation.)
+/// Embeds (`![[…]]`) become images when they name an image file, and labelled
+/// spans otherwise: the PDF cannot show an embedded note.
+/// (Ported from the reference implementation.)
 fn preprocess_wikilinks(markdown: &str) -> String {
-    let re = Regex::new(r"\[\[(.*?)\]\]").unwrap();
-    re.replace_all(markdown, |caps: &regex::Captures| {
-        let target = &caps[1];
-        // Split on | for display text: [[Page|Display]]
-        let (link_target, display_text) = if let Some(pipe_pos) = target.find('|') {
-            (&target[..pipe_pos], target[pipe_pos + 1..].to_string())
-        } else {
-            (target, target.to_string())
-        };
-        if let Some(rest) = link_target.strip_prefix('#') {
-            // In-page anchor: [[#Heading]] or [[#Heading|Display]]
-            let heading = rest.to_lowercase().replace(' ', "-");
-            // Strip leading # from display text for clean rendering
-            let display = display_text.strip_prefix('#').unwrap_or(&display_text);
-            let anchor = format!("#{heading}");
-            format!("[{display}]({anchor})")
-        } else if link_target.contains('#') {
-            // Page with anchor: [[Page#Heading]] or [[Page#Heading|Display]]
-            let parts: Vec<&str> = link_target.splitn(2, '#').collect();
-            let page = parts[0].to_lowercase().replace(' ', "-") + ".html";
-            let anchor = parts[1].to_lowercase().replace(' ', "-");
-            format!("[{display_text}]({page}#{anchor})")
-        } else {
-            // Simple page link: [[Page]] or [[Page|Display]]
-            let link = link_target.to_lowercase().replace(' ', "-") + ".html";
-            format!("[{display_text}]({link})")
-        }
-    })
-    .into_owned()
+    static WIKILINK_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(!?)\[\[(.*?)\]\]").unwrap());
+
+    WIKILINK_RE
+        .replace_all(markdown, |caps: &Captures| {
+            let target = &caps[2];
+            // Split on | for display text: [[Page|Display]]
+            let (link_target, display_text) = if let Some(pipe_pos) = target.find('|') {
+                (&target[..pipe_pos], target[pipe_pos + 1..].to_string())
+            } else {
+                (target, target.to_string())
+            };
+            if !caps[1].is_empty() {
+                return if image_mime(Path::new(link_target)).is_some() {
+                    let src = encode_safe(link_target);
+                    format!("<img src=\"{src}\" alt=\"{src}\">")
+                } else {
+                    format!(
+                        "<span class=\"embed\">Embedded note: {}</span>",
+                        encode_safe(&display_text)
+                    )
+                };
+            }
+            if let Some(rest) = link_target.strip_prefix('#') {
+                // In-page anchor: [[#Heading]] or [[#Heading|Display]]
+                let heading = rest.to_lowercase().replace(' ', "-");
+                // Strip leading # from display text for clean rendering
+                let display = display_text.strip_prefix('#').unwrap_or(&display_text);
+                let anchor = format!("#{heading}");
+                format!("[{display}]({anchor})")
+            } else if link_target.contains('#') {
+                // Page with anchor: [[Page#Heading]] or [[Page#Heading|Display]]
+                let parts: Vec<&str> = link_target.splitn(2, '#').collect();
+                let page = parts[0].to_lowercase().replace(' ', "-") + ".html";
+                let anchor = parts[1].to_lowercase().replace(' ', "-");
+                format!("[{display_text}]({page}#{anchor})")
+            } else {
+                // Simple page link: [[Page]] or [[Page|Display]]
+                let link = link_target.to_lowercase().replace(' ', "-") + ".html";
+                format!("[{display_text}]({link})")
+            }
+        })
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -368,21 +404,28 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+/// MIME type of an image file, judged by its extension.
+fn image_mime(path: &Path) -> Option<&'static str> {
+    Some(
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "ico" => "image/x-icon",
+            "tiff" | "tif" => "image/tiff",
+            "avif" => "image/avif",
+            _ => return None,
+        },
+    )
+}
+
 /// Read an image file and return a base64 data URI (ported).
 fn read_image_as_data_uri(path: &Path) -> Option<String> {
+    let mime = image_mime(path)?;
     let data = std::fs::read(path).ok()?;
-    let mime = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("svg") => "image/svg+xml",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("ico") => "image/x-icon",
-        Some("tiff" | "tif") => "image/tiff",
-        Some("avif") => "image/avif",
-        _ => return None,
-    };
     Some(format!("data:{mime};base64,{}", base64_encode(&data)))
 }
 
@@ -401,30 +444,25 @@ fn mermaid_html(fence: &str) -> Option<String> {
     let code = rest[newline + 1..].strip_suffix("```")?;
 
     let svg = mermaid_svg::render(code).ok()?;
-    let mut options = resvg::usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    let tree = resvg::usvg::Tree::from_str(&svg, &options).ok()?;
-    let natural = tree.size();
-    if natural.width() <= 0.0 || natural.height() <= 0.0 {
-        return None;
-    }
     // Render at 2x for crisp print output, capped to a sane pixmap size.
-    let scale = 2.0f32.min(2400.0 / natural.width().max(1.0));
-    let w = (natural.width() * scale).ceil().max(1.0) as u32;
-    let h = (natural.height() * scale).ceil().max(1.0) as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-    let png = pixmap.encode_png().ok()?;
-    let width_css = natural.width().round().max(1.0) as u32;
+    let raster = crate::svg::rasterize(&svg, 2.0, 2400.0)?;
+    let png = raster.pixmap.encode_png().ok()?;
+    let width_css = raster.width.round().max(1.0) as u32;
     Some(format!(
         "\n\n<div class=\"mermaid\"><img src=\"data:image/png;base64,{}\" \
          alt=\"Mermaid diagram\" width=\"{width_css}\"></div>\n\n",
         base64_encode(&png)
     ))
+}
+
+/// True when the `#` at `i` may start a tag: it follows whitespace or `(`, but
+/// a `(` that opens a link destination (`](#heading)`) does not count.
+fn tag_can_start_at(chars: &[char], i: usize) -> bool {
+    match chars[i - 1] {
+        c if c.is_whitespace() => true,
+        '(' => !(i >= 2 && chars[i - 2] == ']'),
+        _ => false,
+    }
 }
 
 /// Wraps Obsidian tags and Pandoc citations in styled spans. Code fences and
@@ -453,8 +491,7 @@ fn preprocess_tags_and_citations(markdown: &str) -> String {
             }
         }
 
-        // Tag: whitespace or '(' followed by #word.
-        if chars[i] == '#' && i > 0 && (chars[i - 1].is_whitespace() || chars[i - 1] == '(') {
+        if chars[i] == '#' && i > 0 && tag_can_start_at(&chars, i) {
             let mut end = i + 1;
             while end < chars.len()
                 && (chars[end].is_alphanumeric() || matches!(chars[end], '_' | '-' | '/'))
@@ -477,28 +514,83 @@ fn preprocess_tags_and_citations(markdown: &str) -> String {
     out
 }
 
-/// Resolves relative image paths in markdown to base64 data URIs (ported).
-/// Only processes paths that are NOT absolute URLs (`http://`, `https://`,
-/// `data:`, `/`, `#`). Runs before markdown parsing so the parser sees data
-/// URIs natively.
-fn resolve_image_paths(text: &str, base_dir: &Path) -> String {
-    let img_re = Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap();
-    img_re
-        .replace_all(text, |caps: &regex::Captures| {
-            let url = &caps[2];
-            if url.starts_with("http://")
-                || url.starts_with("https://")
-                || url.starts_with("data:")
-                || url.starts_with('/')
-                || url.starts_with('#')
-            {
-                return caps[0].to_string();
-            }
-            let full_path = base_dir.join(url);
-            match read_image_as_data_uri(&full_path) {
-                Some(data_uri) => format!("![{}]({})", &caps[1], data_uri),
-                None => caps[0].to_string(),
-            }
+/// URLs that are left for WeasyPrint as they are: remote, inline and fragments.
+fn is_remote_or_inline(url: &str) -> bool {
+    url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("data:")
+        || url.starts_with('#')
+}
+
+/// Data URI for a local image. Relative and root-relative (`/a.png`) paths
+/// are taken from the document folder, as in the preview.
+fn local_image_uri(url: &str, base_dir: Option<&Path>) -> Option<String> {
+    read_image_as_data_uri(&base_dir?.join(url.trim_start_matches('/')))
+}
+
+/// Quoted `src` / `alt` attribute of an HTML tag: group 1 is the whitespace
+/// before it, group 2 the name, groups 3 and 4 the double- or single-quoted value.
+static HTML_ATTR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)(\s)(src|alt)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
+
+/// Value of a quoted `src` or `alt` attribute in an HTML tag.
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    HTML_ATTR_RE
+        .captures_iter(tag)
+        .find(|caps| caps[2].eq_ignore_ascii_case(name))
+        .and_then(|caps| caps.get(3).or(caps.get(4)))
+        .map(|m| m.as_str())
+}
+
+/// Resolves the `src` of one raw `<img>` tag like a Markdown image. A missing
+/// local image is replaced by its alt text.
+fn resolve_html_img(tag: &str, base_dir: Option<&Path>) -> String {
+    let Some(src) = html_attr(tag, "src") else {
+        return tag.to_string();
+    };
+    if is_remote_or_inline(src) {
+        return tag.to_string();
+    }
+    match local_image_uri(src, base_dir) {
+        Some(uri) => HTML_ATTR_RE
+            .replace_all(tag, |caps: &Captures| {
+                if caps[2].eq_ignore_ascii_case("src") {
+                    format!("{}src=\"{uri}\"", &caps[1])
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned(),
+        None => html_attr(tag, "alt").unwrap_or_default().to_string(),
+    }
+}
+
+/// Resolves local images in Markdown (`![alt](path)`) and raw HTML
+/// (`<img src="path">`) to base64 data URIs, so WeasyPrint never reads files
+/// relative to the temporary HTML file. Remote and `data:` URLs are kept. A
+/// local image that cannot be loaded (or has no document folder to resolve
+/// against) is replaced by its alt text. Runs before markdown parsing so the
+/// parser sees data URIs natively.
+fn resolve_image_paths(text: &str, base_dir: Option<&Path>) -> String {
+    static MD_IMAGE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
+    static HTML_IMG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").unwrap());
+
+    let text = MD_IMAGE_RE.replace_all(text, |caps: &Captures| {
+        // The destination ends at the first space; an optional title follows.
+        let (url, title) = caps[2].split_at(caps[2].find(' ').unwrap_or(caps[2].len()));
+        if is_remote_or_inline(url) {
+            return caps[0].to_string();
+        }
+        match local_image_uri(url, base_dir) {
+            Some(uri) => format!("![{}]({uri}{title})", &caps[1]),
+            None => caps[1].to_string(),
+        }
+    });
+    HTML_IMG_RE
+        .replace_all(&text, |caps: &Captures| {
+            resolve_html_img(&caps[0], base_dir)
         })
         .into_owned()
 }
@@ -507,38 +599,43 @@ fn resolve_image_paths(text: &str, base_dir: &Path) -> String {
 // Main rendering pipeline (based on the reference implementation)
 // ---------------------------------------------------------------------------
 
-/// Render a Markdown string into sanitized HTML body content.
-///
-/// Rasterizes inline/block `<svg>` elements to PNG images for WeasyPrint.
+/// Rasterizes inline/block `<svg>` elements to PNG images for WeasyPrint
+/// (resvg ignores scripts).
 fn preprocess_svg(markdown: &str) -> String {
-    let Ok(re) = Regex::new(r"(?is)<svg\b.*?</svg>") else {
-        return markdown.to_string();
-    };
-    re.replace_all(
-        markdown,
-        |caps: &regex::Captures| match crate::parser::svg_to_png_data_uri(&caps[0]) {
-            Some(uri) => format!("<img src=\"{uri}\" alt=\"SVG image\">"),
-            None => caps[0].to_string(),
-        },
-    )
-    .into_owned()
+    static SVG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<svg\b.*?</svg>").unwrap());
+    SVG_RE
+        .replace_all(
+            markdown,
+            |caps: &Captures| match crate::parser::svg_to_png_data_uri(&caps[0]) {
+                Some(uri) => format!("<img src=\"{uri}\" alt=\"SVG image\">"),
+                None => caps[0].to_string(),
+            },
+        )
+        .into_owned()
 }
 
 /// Replaces `<video>`, `<audio>` and `<iframe>` embeds with labelled links.
 fn preprocess_media_html(markdown: &str) -> String {
+    static MEDIA_RES: LazyLock<Vec<(Regex, &'static str, &'static str)>> = LazyLock::new(|| {
+        [
+            ("video", "Video", "🎬"),
+            ("audio", "Audio", "🔊"),
+            ("iframe", "Embed", "🌐"),
+        ]
+        .into_iter()
+        .map(|(tag, kind, icon)| {
+            let pattern = format!(
+                r#"(?is)<{tag}\b[^>]*?src\s*=\s*["']([^"']+)["'][^>]*?(?:/>|>.*?</{tag}>)"#
+            );
+            (Regex::new(&pattern).unwrap(), kind, icon)
+        })
+        .collect()
+    });
+
     let mut out = markdown.to_string();
-    for (tag, kind, icon) in [
-        ("video", "Video", "🎬"),
-        ("audio", "Audio", "🔊"),
-        ("iframe", "Embed", "🌐"),
-    ] {
-        let pattern =
-            format!(r#"(?is)<{tag}\b[^>]*?src\s*=\s*["']([^"']+)["'][^>]*?(?:/>|>.*?</{tag}>)"#);
-        let Ok(re) = Regex::new(&pattern) else {
-            continue;
-        };
+    for (re, kind, icon) in MEDIA_RES.iter() {
         out = re
-            .replace_all(&out, |caps: &regex::Captures| {
+            .replace_all(&out, |caps: &Captures| {
                 format!(
                     "<p class=\"media\">{icon} <a href=\"{}\" rel=\"noopener noreferrer\">{kind}</a></p>",
                     encode_safe(&caps[1])
@@ -550,20 +647,29 @@ fn preprocess_media_html(markdown: &str) -> String {
 }
 
 /// Replaces a standalone `[TOC]` line with an HTML contents list built from
-/// the document's ATX headings.
+/// the document's ATX headings. Lines inside code fences are ignored.
 fn insert_toc_html(markdown: &str) -> String {
-    let mut headings: Vec<(u8, String)> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
-    for line in markdown.lines() {
-        if let Some((c, n)) = crate::parser::fence_marker_for_export(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
+    // Each line with a flag telling whether it is code (fence markers included).
+    let lines: Vec<(&str, bool)> = markdown
+        .split_inclusive('\n')
+        .map(|line| {
+            let marker = crate::parser::fence_marker_for_export(line);
+            let in_code = fence.is_some() || marker.is_some();
+            if let Some((c, n)) = marker {
+                match fence {
+                    Some((fc, open)) if fc == c && n >= open => fence = None,
+                    None => fence = Some((c, n)),
+                    _ => {}
+                }
             }
-            continue;
-        }
-        if fence.is_some() {
+            (line, in_code)
+        })
+        .collect();
+
+    let mut headings: Vec<(u8, &str)> = Vec::new();
+    for &(line, in_code) in &lines {
+        if in_code {
             continue;
         }
         let trimmed = line.trim_start();
@@ -575,7 +681,7 @@ fn insert_toc_html(markdown: &str) -> String {
             {
                 text = text[..start].trim_end();
             }
-            headings.push((hashes as u8, text.to_string()));
+            headings.push((hashes as u8, text));
         }
     }
     if headings.is_empty() {
@@ -583,18 +689,8 @@ fn insert_toc_html(markdown: &str) -> String {
     }
 
     let mut out = String::with_capacity(markdown.len() + 64);
-    let mut fence: Option<(char, usize)> = None;
-    for line in markdown.split_inclusive('\n') {
-        if let Some((c, n)) = crate::parser::fence_marker_for_export(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_none() && line.trim() == "[TOC]" {
+    for (line, in_code) in lines {
+        if !in_code && line.trim() == "[TOC]" {
             out.push_str("<div class=\"toc\"><strong>Contents</strong><ul>");
             for (level, text) in &headings {
                 out.push_str(&format!(
@@ -623,14 +719,13 @@ fn preprocess_fenced_divs_html(markdown: &str) -> String {
             && !trimmed.chars().all(|c| c == ':')
         {
             let info = trimmed[3..].trim();
-            let class = info
-                .trim_start_matches('{')
-                .trim_end_matches('}')
-                .split_whitespace()
-                .next()
-                .unwrap_or("div")
-                .trim_start_matches('.')
-                .trim_start_matches('#');
+            // `::: warning` or `::: {#id .warning}`: the first `.class` wins.
+            let class = match info.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                Some(attrs) => attrs.split_whitespace().find_map(|t| t.strip_prefix('.')),
+                None => info.split_whitespace().next(),
+            }
+            .unwrap_or("div");
+            let class = encode_safe(class);
             let mut body: Vec<&str> = Vec::new();
             let mut j = i + 1;
             let mut closed = false;
@@ -662,24 +757,27 @@ fn preprocess_fenced_divs_html(markdown: &str) -> String {
     out
 }
 
-/// Ported from the reference implementation `render_markdown_with_base`: fenced code
-/// blocks are protected first (so `---` inside code doesn't interfere with
-/// frontmatter detection), then frontmatter is stripped, then inline code is
-/// protected; the math/emoji/wikilink/callout preprocessors run on the
-/// cleaned content, and image URLs are resolved to data URIs when a
-/// `base_dir` (the document folder) is given. The final pulldown-cmark HTML
-/// is sanitized with ammonia (same tag/attribute policy as the reference implementation).
-pub fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
-    let markdown = &crate::parser::expand_inline_footnotes(markdown);
+/// Renders raw Markdown into sanitized HTML body content for the print template.
+///
+/// Fenced and inline code are protected by placeholders while the text
+/// preprocessors run, so they never alter code, and are restored just before
+/// pulldown-cmark. Frontmatter is stripped, and line endings are normalised to
+/// LF first. Local images are resolved to data URIs relative to `base_dir`
+/// (the document folder). The final pulldown-cmark HTML is sanitized with
+/// ammonia (same tag/attribute policy as the reference implementation).
+fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
+    let markdown = markdown.replace("\r\n", "\n");
+    let markdown = &crate::parser::expand_inline_footnotes(&markdown);
     let markdown = &crate::parser::convert_admonitions(markdown);
     let markdown = &crate::parser::convert_grid_tables(markdown);
     let markdown = &crate::parser::preprocess_abbreviations(markdown);
 
     // Phase 0 — Extract fenced blocks so regex preprocessors don't alter code.
-    let fence_re = Regex::new(r"(?s)```[^\n`]*\n.*?```").unwrap();
+    static FENCE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)```[^\n`]*\n.*?```").unwrap());
     let mut fence_blocks: Vec<String> = Vec::new();
-    let without_fences = fence_re
-        .replace_all(markdown, |caps: &regex::Captures| {
+    let without_fences = FENCE_RE
+        .replace_all(markdown, |caps: &Captures| {
             let idx = fence_blocks.len();
             fence_blocks.push(caps[0].to_string());
             format!("\x00FENCED_BLOCK_{}\x00", idx)
@@ -703,8 +801,10 @@ pub fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
     };
 
     // Strip Pandoc/Markdown-Extra heading attributes from the displayed text.
-    let heading_attrs = Regex::new(r"(?m)^(#{1,6}[ \t]+.*?)[ \t]*\{[#.][^}\n]*\}[ \t]*$").unwrap();
-    let without_frontmatter = heading_attrs
+    static HEADING_ATTRS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^(#{1,6}[ \t]+.*?)[ \t]*\{[#.][^}\n]*\}[ \t]*$").unwrap()
+    });
+    let without_frontmatter = HEADING_ATTRS_RE
         .replace_all(&without_frontmatter, "$1")
         .into_owned();
 
@@ -712,10 +812,10 @@ pub fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
     let without_frontmatter = insert_toc_html(&without_frontmatter);
 
     // Phase 0b — Extract inline code (single backticks) for the same reason.
-    let inline_re = Regex::new(r"`[^`]+`").unwrap();
+    static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]+`").unwrap());
     let mut inline_blocks: Vec<String> = Vec::new();
-    let without_inline = inline_re
-        .replace_all(&without_frontmatter, |caps: &regex::Captures| {
+    let without_inline = INLINE_CODE_RE
+        .replace_all(&without_frontmatter, |caps: &Captures| {
             let idx = inline_blocks.len();
             inline_blocks.push(caps[0].to_string());
             format!("\x00INLINE_CODE_{}\x00", idx)
@@ -729,45 +829,45 @@ pub fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
     // 3. Preprocess wikilinks
     let with_wikilinks = preprocess_wikilinks(&with_emojis);
     // 4. Preprocess callouts
-    let mut with_callouts = preprocess_callouts(&with_wikilinks);
+    let with_callouts = preprocess_callouts(&with_wikilinks);
+    // 5. Inline Obsidian tags and Pandoc citation markers.
+    let with_tags = preprocess_tags_and_citations(&with_callouts);
+    // 6. Inline SVG blocks are rasterized safely (resvg ignores scripts).
+    let with_svg = preprocess_svg(&with_tags);
+    // 7. Resolve local images to data URIs (see resolve_image_paths).
+    let mut restored = resolve_image_paths(&with_svg, base_dir);
 
-    // Restore fenced blocks before markdown parsing.
+    // Restore code only now: the passes above must not see code content.
+    for (idx, block) in inline_blocks.iter().enumerate() {
+        let placeholder = format!("\x00INLINE_CODE_{}\x00", idx);
+        restored = restored.replace(&placeholder, block);
+    }
     for (idx, block) in fence_blocks.iter().enumerate() {
         let placeholder = format!("\x00FENCED_BLOCK_{}\x00", idx);
         let replacement = mermaid_html(block).unwrap_or_else(|| block.clone());
-        with_callouts = with_callouts.replace(&placeholder, &replacement);
+        restored = restored.replace(&placeholder, &replacement);
     }
 
-    // Restore inline code blocks.
-    for (idx, block) in inline_blocks.iter().enumerate() {
-        let placeholder = format!("\x00INLINE_CODE_{}\x00", idx);
-        with_callouts = with_callouts.replace(&placeholder, block);
-    }
-
-    // Inline Obsidian tags and Pandoc citation markers.
-    with_callouts = preprocess_tags_and_citations(&with_callouts);
-    // Inline SVG blocks are rasterized safely (resvg ignores scripts).
-    with_callouts = preprocess_svg(&with_callouts);
-
-    // Phase 0c — Resolve relative image paths to data URIs (if base_dir given).
-    if let Some(base) = base_dir {
-        with_callouts = resolve_image_paths(&with_callouts, base);
-    }
-
-    // 5. Parse markdown (same option set as the reference implementation)
+    // 8. Parse markdown (same option set as the reference implementation)
     use pulldown_cmark::{Options, Parser, html::push_html};
     let mut options = Options::empty();
     options.insert(Options::ENABLE_GFM);
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
-    let parser = Parser::new_ext(&with_callouts, options);
+    let parser = Parser::new_ext(&restored, options);
     let mut unsafe_html = String::new();
     push_html(&mut unsafe_html, parser);
 
-    // 6. Sanitize HTML (same policy as the reference implementation)
-    SanitizerBuilder::new()
-        .rm_tags(&["script"])
+    // 9. Sanitize HTML (same policy as the reference implementation)
+    SANITIZER.clean(&unsafe_html).to_string()
+}
+
+/// Sanitizer policy for the printed HTML: the reference implementation's tags
+/// and attributes plus the elements this pipeline emits.
+static SANITIZER: LazyLock<SanitizerBuilder<'static>> = LazyLock::new(|| {
+    let mut builder = SanitizerBuilder::new();
+    builder
         .add_tags(&[
             "table", "thead", "tbody", "tr", "th", "td", "input", "details", "summary", "img",
             "abbr",
@@ -780,16 +880,15 @@ pub fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
         .add_tag_attributes("details", &["class", "open"])
         .add_tag_attributes("summary", &["class"])
         .add_tag_attributes("img", &["src", "alt", "width", "height", "class"])
-        .add_url_schemes(&["data"])
-        .clean(&unsafe_html)
-        .to_string()
-}
+        .add_url_schemes(&["data"]);
+    builder
+});
 
 // ---------------------------------------------------------------------------
 // Print template (ported from the reference implementation)
 // ---------------------------------------------------------------------------
 
-/// Escapes text for HTML (`html_escape::encode_safe` equivalent).
+/// Escapes `&`, `<`, `>`, `"` and `'` for HTML text and attribute values.
 fn encode_safe(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -854,6 +953,7 @@ const MARKDOWN_BODY_CSS: &str = r##"
   .toc .toc-level-3 { margin-left: 2em; }
   .media { margin: 1em 0; padding: 0.6em 0.8em; background: #f6f8fa; border-radius: 6px; }
   .citation { color: #57606a; font-style: italic; }
+  .embed { color: #57606a; background: #f6f8fa; border: 1px solid #e0e0e0; border-radius: 3px; padding: 0 4px; }
   abbr { text-decoration: none; border-bottom: 1px dotted #94a3b8; }
   .math-inline { vertical-align: middle; color: #0366d6; }
   .math-display { margin: 1em 0; text-align: center; padding: 0.5em 0; }
@@ -886,13 +986,32 @@ const PRINT_CSS: &str = r#"
   }
 "#;
 
+/// Escapes `s` for a double-quoted CSS string inside `<style>`: backslashes,
+/// quotes and control characters are escaped, and `<` so the value cannot
+/// close the `<style>` element. Unlike [`encode_safe`], HTML entities would
+/// print literally here.
+fn css_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '<' => out.push_str("\\3C "),
+            c if c.is_control() => out.push_str(&format!("\\{:X} ", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Builds the complete print document — the ported union of the reference implementation's
 /// `pdf_export.rs` template (A4 page setup, footer with
 /// `filename - Page n of m` counters) and its print `.markdown-body` styles.
 ///
 /// `markdown_html` is sanitized body HTML (see [`render_markdown`]).
-pub fn prepare_print_html(markdown_html: &str, filename: &str) -> String {
+fn prepare_print_html(markdown_html: &str, filename: &str) -> String {
     let escaped_filename = encode_safe(filename);
+    let css_filename = css_string(filename);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -904,7 +1023,7 @@ pub fn prepare_print_html(markdown_html: &str, filename: &str) -> String {
   size: A4;
   margin: 2cm 2cm 2.5cm 2cm;
   @bottom-center {{
-    content: "{escaped_filename} - Page " counter(page) " of " counter(pages);
+    content: "{css_filename} - Page " counter(page) " of " counter(pages);
     font-size: 7pt;
     color: #666;
   }}
@@ -926,6 +1045,7 @@ body {{
 </body>
 </html>"#,
         escaped_filename = escaped_filename,
+        css_filename = css_filename,
         MARKDOWN_BODY_CSS = MARKDOWN_BODY_CSS,
         PRINT_CSS = PRINT_CSS,
         markdown_html = markdown_html
@@ -939,7 +1059,8 @@ body {{
 /// Renders the raw Markdown source into the complete print HTML document.
 ///
 /// `base_dir` is the folder containing the source file, used for relative
-/// image resolution (data URIs). `filename` labels the running footer.
+/// image resolution (data URIs); without it local images become their alt
+/// text. `filename` labels the running footer.
 pub fn print_html_for(markdown: &str, base_dir: Option<&Path>, filename: &str) -> String {
     let body = render_markdown(markdown, base_dir);
     prepare_print_html(&body, filename)
@@ -1078,20 +1199,137 @@ mod tests {
         assert!(output.contains("<img src=\"data:image/png;base64,"));
     }
 
-    /// Local image files are embedded as data URIs; missing files pass through.
-    #[test]
-    fn it_resolves_local_images_as_data_uris() {
+    /// Scratch folder holding a stub `dot.png`, unique per test.
+    fn image_test_dir(tag: &str) -> std::path::PathBuf {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("mdv-imgtest-{}-{ts}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mdv-imgtest-{tag}-{}-{ts}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("dot.png"), b"\x89PNG-stub").unwrap();
+        dir
+    }
+
+    /// Local image files are embedded as data URIs.
+    #[test]
+    fn it_resolves_local_images_as_data_uris() {
+        let dir = image_test_dir("md");
         let output = render_markdown("![Alt](dot.png)", Some(&dir));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(output.contains("data:image/png;base64,"));
         assert!(output.contains("Alt"));
+    }
+
+    /// Raw `<img>` tags and root-relative paths resolve against the document
+    /// folder, like Markdown images.
+    #[test]
+    fn html_and_root_relative_images_are_resolved() {
+        let dir = image_test_dir("html");
+        let output = render_markdown(
+            "<img src=\"dot.png\" alt=\"A\">\n\n![B](/dot.png)",
+            Some(&dir),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(output.matches("data:image/png;base64,").count(), 2);
+        assert!(!output.contains("src=\"dot.png\""));
+    }
+
+    /// Missing or unresolvable local images show their alt text; remote
+    /// images are left for WeasyPrint.
+    #[test]
+    fn missing_local_images_degrade_to_alt_text() {
+        let dir = image_test_dir("missing");
+        let output = render_markdown(
+            "![Logo](missing.png)\n\n<img src=\"gone.png\" alt=\"Gone\">",
+            Some(&dir),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.contains("Logo") && output.contains("Gone"));
+        assert!(!output.contains("missing.png") && !output.contains("gone.png"));
+        assert!(!output.contains("<img"));
+
+        let without_folder = render_markdown("![Logo](dot.png)", None);
+        assert_eq!(without_folder, "<p>Logo</p>\n");
+
+        let remote = render_markdown("![R](https://example.com/a.png)", None);
+        assert!(remote.contains("src=\"https://example.com/a.png\""));
+    }
+
+    /// `![[image.png]]` embeds an image; other embeds become a labelled span
+    /// instead of a broken image.
+    #[test]
+    fn wiki_embeds_are_images_or_labelled_spans() {
+        let dir = image_test_dir("wiki");
+        let image = render_markdown("![[dot.png]]", Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(image.contains("data:image/png;base64,"));
+
+        let note = render_markdown("![[Some Note]]", None);
+        assert!(note.contains("<span class=\"embed\">Embedded note: Some Note</span>"));
+        assert!(!note.contains("<img"));
+    }
+
+    /// Code (fenced and inline) is restored after the text passes, so tags,
+    /// emoji and image syntax inside code stay literal.
+    #[test]
+    fn code_content_is_left_intact() {
+        let dir = image_test_dir("code");
+        let input = "Use `x = 1  # note` here.\n\n```\n![](dot.png) #tag :rocket:\n```\n";
+        let output = render_markdown(input, Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.contains("<code>x = 1  # note</code>"));
+        assert!(output.contains("![](dot.png) #tag :rocket:"));
+        assert!(!output.contains("class=\"tag\""));
+        assert!(!output.contains("data:image"));
+    }
+
+    /// `#` in a link destination is not a tag; a real `(#tag)` still is.
+    #[test]
+    fn link_destinations_are_not_tags() {
+        let output = render_markdown("[text](#heading) and [[#Heading]] but (#tag) too", None);
+        assert!(output.contains("href=\"#heading\""));
+        assert_eq!(output.matches("class=\"tag\"").count(), 1);
+    }
+
+    /// Non-ASCII callout types must not panic and keep their full name.
+    #[test]
+    fn callout_with_non_ascii_type() {
+        let output = render_markdown("> [!Éclair]\n> Body", None);
+        assert!(output.contains("callout éclair"), "{output}");
+        assert!(output.contains("Éclair"));
+    }
+
+    /// Callout bodies are Markdown: emphasis and several paragraphs render.
+    #[test]
+    fn callout_bodies_render_as_markdown() {
+        let output = render_markdown("> [!NOTE]\n> **bold** text\n>\n> Second paragraph.", None);
+        assert!(output.contains("<strong>bold</strong> text"), "{output}");
+        assert!(output.contains("<p>Second paragraph.</p>"));
+    }
+
+    /// `-` folds a callout closed and `+` opens it, as in the preview.
+    #[test]
+    fn callout_fold_markers() {
+        let collapsed = render_markdown("> [!tip]-\n> Hidden", None);
+        assert!(collapsed.contains("<details class=\"callout tip\"><summary>Tip</summary>"));
+        let expanded = render_markdown("> [!tip]+\n> Shown", None);
+        assert!(expanded.contains("<details class=\"callout tip\" open=\"open\">"));
+    }
+
+    /// Pandoc attribute blocks give the class from their `.class` token.
+    #[test]
+    fn fenced_div_attributes_yield_the_class() {
+        let output = render_markdown("::: {#intro .warning}\nBody\n:::\n", None);
+        assert!(output.contains("class=\"fenced-div warning\""), "{output}");
+    }
+
+    /// CRLF line endings must not hide the YAML frontmatter.
+    #[test]
+    fn crlf_input_strips_frontmatter() {
+        let output = render_markdown("---\r\ntitle: X\r\n---\r\n# Hi\r\n", None);
+        assert_eq!(output, "<h1>Hi</h1>\n");
     }
 
     /// The print template carries the A4 page rule, the footer counters and
@@ -1107,13 +1345,18 @@ mod tests {
         assert!(html.contains("<p>content</p>"));
     }
 
-    /// The footer label must be HTML-escaped in both `<title>` and the CSS
-    /// `content` string.
+    /// The footer label is CSS-escaped inside the `content` string (no HTML
+    /// entities), and the `<title>` is HTML-escaped.
     #[test]
     fn print_template_escapes_filename() {
-        let html = prepare_print_html("x", "a<>&\".md");
-        assert!(!html.contains("<title>a<>&\".md"));
-        assert!(html.contains("\\\".md") || html.contains("&quot;"));
+        let html = prepare_print_html("x", "a&\"\\b.md");
+        assert!(html.contains(r#"<title>a&amp;&quot;\b.md</title>"#));
+        assert!(html.contains(r#"content: "a&\"\\b.md - Page " counter(page)"#));
+    }
+
+    #[test]
+    fn css_string_escapes_quotes_backslashes_and_newlines() {
+        assert_eq!(css_string("a\"b\\c\nd<"), "a\\\"b\\\\c\\A d\\3C ");
     }
 
     /// End-to-end: raw markdown → print document.
