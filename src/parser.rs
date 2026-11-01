@@ -1575,45 +1575,56 @@ fn strip_unsafe_html(md: &str) -> String {
             continue;
         }
 
-        let lower = line.to_ascii_lowercase();
-        if lower.trim_start().starts_with("<!--") {
-            // Comments may span multiple lines.
-            let mut rest = line.to_string();
-            while !rest.contains("-->") {
-                match lines.next() {
-                    Some(next) => rest.push_str(next),
-                    None => break,
-                }
-            }
-            // Keep the line count stable so source-line mapping (used by
-            // click-to-source navigation) stays valid: replace the removed
-            // lines with blank lines.
-            for _ in 0..rest.matches('\n').count() {
-                out.push('\n');
-            }
+        let lower = line.trim_start().to_ascii_lowercase();
+        if lower.starts_with("<!--") {
+            skip_block(line, "-->", &mut lines, &mut out);
             continue;
         }
-        if lower.trim_start().starts_with("<script") || lower.trim_start().starts_with("<style") {
-            let closing = if lower.trim_start().starts_with("<script") {
-                "</script>"
-            } else {
-                "</style>"
-            };
-            let mut rest = line.to_string();
-            while !rest.to_ascii_lowercase().contains(closing) {
-                match lines.next() {
-                    Some(next) => rest.push_str(next),
-                    None => break,
-                }
-            }
-            for _ in 0..rest.matches('\n').count() {
-                out.push('\n');
-            }
+        if lower.starts_with("<script") {
+            skip_block(line, "</script>", &mut lines, &mut out);
+            continue;
+        }
+        if lower.starts_with("<style") {
+            skip_block(line, "</style>", &mut lines, &mut out);
             continue;
         }
         out.push_str(line);
     }
     out
+}
+
+/// Drops a block that starts on `first` and ends on the first line containing
+/// `closing` (ASCII case-insensitive). Text after the closing marker is kept.
+///
+/// The removed lines are replaced by blank lines so the line count, and with it
+/// click-to-source navigation, stays valid.
+fn skip_block(
+    first: &str,
+    closing: &str,
+    lines: &mut std::str::SplitInclusive<'_, char>,
+    out: &mut String,
+) {
+    let mut current = first;
+    let mut removed_newlines = 0usize;
+    loop {
+        if let Some(pos) = current.to_ascii_lowercase().find(closing) {
+            for _ in 0..removed_newlines {
+                out.push('\n');
+            }
+            out.push_str(&current[pos + closing.len()..]);
+            return;
+        }
+        removed_newlines += current.matches('\n').count();
+        match lines.next() {
+            Some(next) => current = next,
+            None => {
+                for _ in 0..removed_newlines {
+                    out.push('\n');
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// Replaces `$$…$$` and `\[…\]` display math with a sentinel fenced block.
@@ -5114,6 +5125,30 @@ mod regression_tests {
 
     fn summaries(doc: &Document) -> Vec<String> {
         doc.blocks.iter().map(Block::summarize).collect()
+    }
+
+    #[test]
+    fn text_after_a_comment_close_is_kept() {
+        assert_eq!(strip_unsafe_html("<!-- note -->Visible\n"), "Visible\n");
+        assert_eq!(
+            strip_unsafe_html("<!--\nhidden\n--> after\nnext\n"),
+            "\n\n after\nnext\n"
+        );
+    }
+
+    #[test]
+    fn unclosed_comment_keeps_the_line_count() {
+        let md = "a\n<!-- open\nhidden\nstill hidden";
+        assert_eq!(strip_unsafe_html(md), "a\n\n\n");
+    }
+
+    #[test]
+    fn script_and_style_blocks_are_removed_with_trailing_text() {
+        assert_eq!(
+            strip_unsafe_html("<script>\nalert(1)\n</script>kept\n"),
+            "\n\nkept\n"
+        );
+        assert_eq!(strip_unsafe_html("<STYLE>p{}</STYLE>\nx\n"), "\nx\n");
     }
 
     fn links(text: &str) -> Vec<String> {
