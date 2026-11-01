@@ -1384,10 +1384,8 @@ impl App {
                 {
                     let result = crate::macos_print::print_pdf(&path);
                     match result {
-                        Ok(()) => self.set_status("Print dialog opened.", false),
-                        Err(e) if e.contains("cancelled") => {
-                            self.set_status("Print cancelled.", false)
-                        }
+                        Ok(true) => self.set_status("Print dialog opened.", false),
+                        Ok(false) => self.set_status("Print cancelled.", false),
                         Err(e) => self.set_status(format!("Print failed: {e}"), true),
                     }
                 }
@@ -1657,18 +1655,7 @@ impl App {
             self.find_index = 0;
         }
         self.find_cache = (self.find_query.clone(), self.preview_revision);
-        self.find_matches.clear();
-        let query = self.find_query.to_ascii_lowercase();
-        if query.is_empty() {
-            return query_changed;
-        }
-        let hay = self.text.to_ascii_lowercase();
-        let mut start = 0usize;
-        while let Some(pos) = hay[start..].find(&query) {
-            let begin = start + pos;
-            self.find_matches.push((begin, begin + query.len()));
-            start = begin + query.len();
-        }
+        self.find_matches = find_all_case_insensitive(&self.text, &self.find_query);
         if self.find_index >= self.find_matches.len() {
             self.find_index = 0;
         }
@@ -3504,12 +3491,24 @@ fn render_block(
                 _ => (f * 0.95, 11.0, 4.0),
             };
             ui.add_space(top);
-            ui.label(
-                RichText::new(plain_text(inlines))
-                    .font(bold_font(size))
-                    .color(palette().text)
-                    .line_height(Some(size * 1.25)),
-            );
+            // Same inline path as paragraphs, so links, code and find-matches
+            // inside a heading are kept and highlighted.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let bold = InlineStyle {
+                    bold: true,
+                    ..InlineStyle::default()
+                };
+                render_inlines_styled(
+                    ui,
+                    visual_inlines(inlines).as_ref(),
+                    size,
+                    bold,
+                    base_dir,
+                    image_click,
+                    math_cache,
+                );
+            });
             // Atx/setext headings are not underlined in the reference layout.
             // The only horizontal rules in a document are explicit `---`
             // blocks (Block::Rule), which are rendered separately.
@@ -5179,9 +5178,50 @@ thread_local! {
 }
 
 /// Sets (or clears) the find query used by the preview renderer. Matching is
-/// ASCII case-insensitive.
+/// case-insensitive (see [`find_all_case_insensitive`]).
 fn set_preview_find(query: Option<String>) {
     PREVIEW_FIND.with(|slot| *slot.borrow_mut() = query);
+}
+
+/// Byte ranges of the non-overlapping matches of `query` in `text`.
+///
+/// Characters are compared after simple Unicode lowercasing, so `É` matches
+/// `é`. The ranges index `text` itself, even where lowercasing changes byte
+/// lengths.
+fn find_all_case_insensitive(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let mut matches = Vec::new();
+    if needle.is_empty() {
+        return matches;
+    }
+    let mut pos = 0usize;
+    while pos < text.len() {
+        match case_insensitive_match_end(text, pos, &needle) {
+            Some(end) => {
+                matches.push((pos, end));
+                pos = end;
+            }
+            None => pos += text[pos..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    matches
+}
+
+/// End byte of a match of the lowercased `needle` starting at byte `start`.
+fn case_insensitive_match_end(text: &str, start: usize, needle: &[char]) -> Option<usize> {
+    let mut rest = needle;
+    for (offset, ch) in text[start..].char_indices() {
+        for lower in ch.to_lowercase() {
+            match rest.split_first() {
+                Some((first, tail)) if *first == lower => rest = tail,
+                _ => return None,
+            }
+        }
+        if rest.is_empty() {
+            return Some(start + offset + ch.len_utf8());
+        }
+    }
+    None
 }
 
 /// Appends text, painting occurrences of the active find query.
@@ -5194,19 +5234,16 @@ fn append_text_highlighted(job: &mut egui::text::LayoutJob, text: &str, f: f32, 
             }
             return;
         };
-        let hay = text.to_ascii_lowercase();
-        let needle = query.to_ascii_lowercase();
         let mut start = 0usize;
-        while let Some(pos) = hay[start..].find(&needle) {
-            let begin = start + pos;
+        for (begin, end) in find_all_case_insensitive(text, query) {
             if begin > start {
                 job.append(&text[start..begin], 0.0, inline_text_format(f, st));
             }
             let mut format = inline_text_format(f, st);
             format.background = palette().highlight_bg;
             format.color = palette().highlight_text;
-            job.append(&text[begin..begin + needle.len()], 0.0, format);
-            start = begin + needle.len();
+            job.append(&text[begin..end], 0.0, format);
+            start = end;
         }
         if start < text.len() {
             job.append(&text[start..], 0.0, inline_text_format(f, st));
@@ -5646,7 +5683,42 @@ impl BytesLoader for CurlBytesLoader {
 }
 
 /// Downloads one URL with `/usr/bin/curl` (always present on macOS).
+/// True when `url` points at this machine or a link-local address (loopback,
+/// `localhost`, `0.0.0.0`, `169.254.0.0/16` such as cloud metadata endpoints,
+/// `fe80::/10`). Private LAN addresses are allowed, since intranet images are
+/// legitimate. Redirects are followed by curl and are not re-checked.
+fn is_local_host(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(bracketed) = host.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    }
+    .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_unspecified() || v4.is_link_local()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    false
+}
+
 fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
+    if is_local_host(url) {
+        return Err("images from this machine are not fetched".into());
+    }
     let max_bytes = MAX_REMOTE_BYTES.to_string();
     let output = std::process::Command::new("/usr/bin/curl")
         .args([
@@ -6320,13 +6392,17 @@ fn data_uri_to_temp_file(uri: &str) -> Option<String> {
         return None;
     }
     let mime = meta.trim_end_matches(";base64");
+    // A fixed list keeps the MIME type from choosing the file name. Unknown
+    // types get `bin`; the image loaders detect the format from the bytes.
     let extension = match mime {
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
         "image/svg+xml" => "svg",
-        otherwise => otherwise.rsplit('/').next().unwrap_or("bin"),
+        _ => "bin",
     };
     let bytes = base64_decode(payload)?;
     check_download_limits(&bytes).ok()?;
@@ -6336,9 +6412,21 @@ fn data_uri_to_temp_file(uri: &str) -> Option<String> {
     let path =
         std::env::temp_dir().join(format!("mdviewer-data-{:x}.{extension}", hash_key(&bytes)));
     if !path.exists() {
-        std::fs::write(&path, &bytes).ok()?;
+        write_atomically(&path, &bytes)?;
     }
     Some(file_uri(&path))
+}
+
+/// Writes `bytes` to `path` through a partial file, so an interrupted write
+/// never leaves a truncated file that later loads would reuse.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Option<()> {
+    let partial = path.with_extension(format!(
+        "{}.part{}",
+        path.extension()?.to_str()?,
+        std::process::id()
+    ));
+    std::fs::write(&partial, bytes).ok()?;
+    std::fs::rename(&partial, path).ok()
 }
 
 fn base64_decode(value: &str) -> Option<Vec<u8>> {
@@ -6399,16 +6487,19 @@ fn convert_avif_preview(url: &str, base_dir: Option<&Path>) -> Option<String> {
     if FAILED_AVIF.lock().is_ok_and(|failed| failed.contains(&out)) {
         return None;
     }
+    let partial = out.with_extension(format!("png.part{}", std::process::id()));
     let converted = std::process::Command::new("/usr/bin/sips")
         .args(["-s", "format", "png"])
         .arg(&path)
         .arg("--out")
-        .arg(&out)
+        .arg(&partial)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|status| status.success());
+        .is_ok_and(|status| status.success())
+        && std::fs::rename(&partial, &out).is_ok();
     if !converted {
+        let _ = std::fs::remove_file(&partial);
         if let Ok(mut failed) = FAILED_AVIF.lock() {
             failed.insert(out);
         }
@@ -7154,6 +7245,17 @@ mod render_smoke_tests {
         }
     }
 
+    #[test]
+    fn headings_keep_inline_code_and_links() {
+        let text = run_preview(
+            "## Title with `code` and [link](https://example.com)",
+            800.0,
+            theme::Mode::Dark,
+        );
+        assert!(text.contains("code"), "{text:?}");
+        assert!(text.contains("link"), "{text:?}");
+    }
+
     /// Large documents take the virtualized preview path (only the visible
     /// window is laid out). Smoke-test that it renders without panicking.
     #[test]
@@ -7588,6 +7690,21 @@ mod helper_tests {
     use super::*;
 
     #[test]
+    fn find_is_case_insensitive_for_non_ascii_text() {
+        let text = "Café CAFÉ café";
+        let matches = find_all_case_insensitive(text, "café");
+        assert_eq!(matches.len(), 3);
+        for (start, end) in matches {
+            assert!(text[start..end].to_lowercase() == "café");
+        }
+        assert!(find_all_case_insensitive(text, "").is_empty());
+        assert_eq!(
+            find_all_case_insensitive("aaaa", "aa"),
+            vec![(0, 2), (2, 4)]
+        );
+    }
+
+    #[test]
     fn long_paths_are_shortened_on_character_boundaries() {
         let ascii = Path::new("/Users/someone/Documents/projects/markdown/notes/file.md");
         let label = ellipsize_path(ascii);
@@ -7686,6 +7803,17 @@ mod remote_tests {
     fn raster_dimensions_read_png_headers() {
         let png = include_bytes!("../assets/AppIcon-1024.png");
         assert_eq!(raster_dimensions(png), Some((1024, 1024)));
+    }
+
+    #[test]
+    fn local_and_link_local_hosts_are_not_fetched() {
+        assert!(is_local_host("http://localhost:8080/x.png"));
+        assert!(is_local_host("https://127.0.0.1/x.png"));
+        assert!(is_local_host("http://169.254.169.254/latest/meta-data"));
+        assert!(is_local_host("http://[::1]:8080/x.png"));
+        assert!(is_local_host("http://user@0.0.0.0/x"));
+        assert!(!is_local_host("https://img.shields.io/badge/Rust-2024"));
+        assert!(!is_local_host("https://192.168.1.10/logo.png"));
     }
 
     #[test]

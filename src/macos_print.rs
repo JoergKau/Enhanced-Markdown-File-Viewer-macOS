@@ -7,10 +7,11 @@
 //!
 //! Must be called on the main thread (the UI thread).
 
-/// Shows the macOS print dialog for `path`. Returns an error when the PDF
-/// cannot be opened or the operation fails.
+/// Shows the macOS print dialog for `path`. Returns `Ok(true)` when the dialog
+/// was shown (a sheet on the main window), `Ok(false)` when the user cancelled a
+/// standalone dialog, and an error when the PDF cannot be opened or printed.
 #[cfg(target_os = "macos")]
-pub fn print_pdf(path: &std::path::Path) -> Result<(), String> {
+pub fn print_pdf(path: &std::path::Path) -> Result<bool, String> {
     imp::print_pdf(path)
 }
 
@@ -22,7 +23,7 @@ mod imp {
     use objc2_pdf_kit::{PDFDocument, PDFPrintScalingMode};
     use std::path::Path;
 
-    pub fn print_pdf(path: &Path) -> Result<(), String> {
+    pub fn print_pdf(path: &Path) -> Result<bool, String> {
         let mtm = MainThreadMarker::new().ok_or("printing must run on the main thread")?;
         let path_str = path.to_str().ok_or("the PDF path is not valid UTF-8")?;
         let ns_path = NSString::from_str(path_str);
@@ -58,11 +59,9 @@ mod imp {
                     std::ptr::null_mut(),
                 );
             }
-            Ok(())
-        } else if operation.runOperation() {
-            Ok(())
+            Ok(true)
         } else {
-            Err("printing was cancelled".into())
+            Ok(operation.runOperation())
         }
     }
 }
