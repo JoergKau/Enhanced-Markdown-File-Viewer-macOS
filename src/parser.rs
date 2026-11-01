@@ -983,11 +983,17 @@ fn source_lines(blocks: &[Block], md: &str) -> Vec<usize> {
         } else if matches!(block, Block::Details { .. }) {
             (cursor..lines.len()).find(|&i| lines[i].to_ascii_lowercase().contains("<details"))
         } else {
-            let needles = block_needles(block);
-            needles.iter().find_map(|needle| {
-                (!needle.is_empty())
-                    .then(|| (cursor..lines.len()).find(|&i| lines[i].contains(needle.as_str())))
-                    .flatten()
+            // One pass over the lines: the first line that contains any needle
+            // wins. Trying each needle as its own scan made every failing
+            // needle walk to the end of the document.
+            let needles: Vec<String> = block_needles(block)
+                .into_iter()
+                .filter(|needle| !needle.is_empty())
+                .collect();
+            (cursor..lines.len().min(cursor + SOURCE_LINE_WINDOW)).find(|&i| {
+                needles
+                    .iter()
+                    .any(|needle| lines[i].contains(needle.as_str()))
             })
         };
         if let Some(i) = found {
@@ -999,6 +1005,11 @@ fn source_lines(blocks: &[Block], md: &str) -> Vec<usize> {
     }
     out
 }
+
+/// How many lines past the previous block are searched for the next one. A
+/// block whose text cannot be found keeps the previous position instead of
+/// scanning the rest of the document, which kept reparsing quadratic.
+const SOURCE_LINE_WINDOW: usize = 1000;
 
 /// Candidate search strings for a block, from most to least specific.
 fn block_needles(block: &Block) -> Vec<String> {
@@ -5125,6 +5136,12 @@ mod regression_tests {
 
     fn summaries(doc: &Document) -> Vec<String> {
         doc.blocks.iter().map(Block::summarize).collect()
+    }
+
+    #[test]
+    fn paragraphs_with_inline_markup_map_to_their_source_line() {
+        let doc = parse("# Title\n\nFirst *emphasis* here.\n\nSecond `code` and [a link](x).\n");
+        assert_eq!(doc.block_lines, vec![1, 3, 5]);
     }
 
     #[test]
