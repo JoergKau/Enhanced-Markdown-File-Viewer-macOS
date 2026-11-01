@@ -3,16 +3,17 @@
 //! # Purpose
 //!
 //! This module encapsulates **the entire Markdown parser** behind a small,
-//! UI-independent data model. The live preview (`ui.rs`) and the PDF export
-//! (`export.rs`) consume nothing but [`Document`] — so both are guaranteed to
-//! see the same interpretation of the source text, and the parser can be
-//! tested without any GUI.
+//! UI-independent data model. The live preview (`ui.rs`) consumes nothing but
+//! [`Document`]. The PDF export renders the Markdown source through
+//! `html_export.rs`, which reuses the source-level helpers defined here so both
+//! paths interpret the text the same way. The parser can be tested without any
+//! GUI.
 //!
 //! # Pipeline
 //!
 //! ```text
 //! Markdown string
-//!   └─ preprocess (protect display math, <details>, strip comments/scripts)
+//!   └─ preprocess (comments/scripts, math, [TOC], tables, abbreviations, divs, admonitions, <details>)
 //!        └─ pulldown-cmark (CommonMark + GFM flags)
 //!             └─ event stream (Vec<Event<'static>>)
 //!                  └─ Walker (state machine, cursor `pos`)
@@ -27,9 +28,10 @@
 //!
 //! # Extension layers
 //!
-//! * [`preprocess`] protects constructs pulldown-cmark cannot represent
-//!   (`$$…$$` with lone `=` lines, `<details>` across blank lines) and removes
-//!   unsafe HTML comments/scripts.
+//! * [`preprocess`] rewrites constructs pulldown-cmark cannot represent
+//!   (`$$…$$` with lone `=` lines, `<details>` across blank lines, `[TOC]`,
+//!   fenced divs, admonitions, grid tables) and removes unsafe HTML
+//!   comments/scripts.
 //! * The [`Walker`] builds the structural model (paragraphs, lists, tables,
 //!   footnotes, definition lists, Mermaid, details).
 //! * [`postprocess_blocks`] adds text-level extensions that have no pulldown
@@ -200,9 +202,6 @@ pub enum Inline {
     Citation(String),
     /// Markdown Extra abbreviation (`*[HTML]: HyperText Markup Language`).
     Abbr { text: String, title: String },
-    /// `<br/>`, HTML spans etc. — the raw text is preserved.
-    #[allow(dead_code)] // reserved for HTML fragments that cannot be interpreted
-    RawHtml(String),
     /// ^superscript^
     Super(Vec<Inline>),
     /// ~subscript~
@@ -210,14 +209,45 @@ pub enum Inline {
 }
 
 impl Inline {
+    /// Nested inline content of a styling element or link (empty otherwise).
+    fn children(&self) -> &[Inline] {
+        match self {
+            Inline::Emph(c)
+            | Inline::Strong(c)
+            | Inline::Strike(c)
+            | Inline::Highlight(c)
+            | Inline::Underline(c)
+            | Inline::Kbd(c)
+            | Inline::Super(c)
+            | Inline::Sub(c)
+            | Inline::Link { inlines: c, .. } => c.as_slice(),
+            _ => &[],
+        }
+    }
+
+    fn children_mut(&mut self) -> &mut [Inline] {
+        match self {
+            Inline::Emph(c)
+            | Inline::Strong(c)
+            | Inline::Strike(c)
+            | Inline::Highlight(c)
+            | Inline::Underline(c)
+            | Inline::Kbd(c)
+            | Inline::Super(c)
+            | Inline::Sub(c)
+            | Inline::Link { inlines: c, .. } => c.as_mut_slice(),
+            _ => &mut [],
+        }
+    }
+
     /// Unformatted text content.
     ///
     /// Used for alt texts, PDF metadata and column widths. Links prefer the
     /// link text, images use their alt text, and footnote references appear
-    /// as `[label]`.
+    /// as their number (or `[label]` before numbering).
     pub fn plain_text(&self) -> String {
         match self {
-            Inline::Text(t) | Inline::Code(t) | Inline::RawHtml(t) => t.clone(),
+            Inline::Text(t) | Inline::Code(t) => t.clone(),
             Inline::Emph(c)
             | Inline::Strong(c)
             | Inline::Strike(c)
@@ -403,9 +433,29 @@ pub enum Block {
 }
 
 impl Block {
+    /// Blocks nested directly inside a container (quote, details, div, group).
+    fn nested_blocks(&self) -> Option<&[Block]> {
+        match self {
+            Block::BlockQuote { blocks, .. }
+            | Block::Details { blocks, .. }
+            | Block::FencedDiv { blocks, .. }
+            | Block::Group(blocks) => Some(blocks.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn nested_blocks_mut(&mut self) -> Option<&mut Vec<Block>> {
+        match self {
+            Block::BlockQuote { blocks, .. }
+            | Block::Details { blocks, .. }
+            | Block::FencedDiv { blocks, .. }
+            | Block::Group(blocks) => Some(blocks),
+            _ => None,
+        }
+    }
+
     /// First line of inline content of a block (e.g. for outlines/table of
     /// contents or fallback text in the PDF).
-    #[allow(dead_code)] // public helper for future outline/search features
     pub fn summarize(&self) -> String {
         match self {
             Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
@@ -476,9 +526,9 @@ pub struct Document {
 }
 
 impl Document {
-    /// Text of all inline elements of the given blocks (utility for the
-    /// status bar etc.).
-    #[allow(dead_code)] // used by tests and available to future UI panels
+    /// Plain text of the given blocks: one line per heading or paragraph, the
+    /// summary of every other block. Used by tests.
+    #[cfg(test)]
     pub fn plain_blocks(blocks: &[Block]) -> String {
         let mut out = String::new();
         for b in blocks {
@@ -517,18 +567,6 @@ fn parser_options() -> Options {
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
 }
 
-/// Parses Markdown into a [`Document`].
-///
-/// Enabled extensions: GFM tables, strikethrough, task lists, footnotes,
-/// LaTeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`), GFM alerts (`> [!NOTE]`),
-/// Obsidian callouts/wiki-links/embeds, definition lists, YAML front matter,
-/// super-/subscript, `==highlight==` and a small, safe HTML subset.
-///
-/// # Complexity
-///
-/// One linear pass over the materialized events. The parser is deliberately
-/// total (no panics on exotic input) and guarantees progress (see the module
-/// docs).
 /// Extracts YAML, TOML (`+++`) or JSON front matter and returns the remaining
 /// Markdown. Nested maps are flattened to dotted keys for the Properties card.
 fn extract_front_matter(markdown: &str) -> (Vec<(String, String)>, String) {
@@ -728,7 +766,10 @@ fn strip_heading_attributes(inlines: &mut [Inline]) {
         return;
     };
     let attributes = &trimmed[start + 1..trimmed.len() - 1];
-    if attributes.is_empty()
+    let has_attribute_token = attributes
+        .split_whitespace()
+        .any(|token| token.starts_with(['#', '.']) || token.contains('='));
+    if !has_attribute_token
         || !attributes.chars().all(|c| {
             c.is_alphanumeric()
                 || matches!(
@@ -747,19 +788,10 @@ fn strip_heading_attributes(inlines: &mut [Inline]) {
 pub(crate) fn expand_inline_footnotes(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len() + 64);
     let mut definitions: Vec<String> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
 
     for line in markdown.split_inclusive('\n') {
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             continue;
         }
@@ -808,23 +840,14 @@ pub(crate) fn expand_inline_footnotes(markdown: &str) -> String {
 /// Replaces `[TOC]` lines with a sentinel block.
 fn protect_toc(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len() + 16);
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     for line in markdown.split_inclusive('\n') {
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
+        if fence.feed(line) || line.trim() != "[TOC]" {
             out.push_str(line);
-            continue;
-        }
-        if fence.is_none() && line.trim() == "[TOC]" {
+        } else {
             out.push_str("```");
             out.push_str(TOC_LANG);
             out.push_str("\n```\n");
-        } else {
-            out.push_str(line);
         }
     }
     out
@@ -835,15 +858,10 @@ fn collect_headings(blocks: &[Block]) -> Vec<(u8, String)> {
     let mut out = Vec::new();
     fn visit(blocks: &[Block], out: &mut Vec<(u8, String)>) {
         for block in blocks {
-            match block {
-                Block::Heading { level, inlines } => {
-                    out.push((*level, inlines.iter().map(|i| i.plain_text()).collect()))
-                }
-                Block::BlockQuote { blocks, .. }
-                | Block::Details { blocks, .. }
-                | Block::FencedDiv { blocks, .. }
-                | Block::Group(blocks) => visit(blocks, out),
-                _ => {}
+            if let Block::Heading { level, inlines } = block {
+                out.push((*level, inlines.iter().map(|i| i.plain_text()).collect()));
+            } else if let Some(inner) = block.nested_blocks() {
+                visit(inner, out);
             }
         }
     }
@@ -853,20 +871,29 @@ fn collect_headings(blocks: &[Block]) -> Vec<(u8, String)> {
 
 fn fill_toc(blocks: &mut [Block], headings: &[(u8, String)]) {
     for block in blocks {
-        match block {
-            Block::Toc(entries) => *entries = headings.to_vec(),
-            Block::BlockQuote { blocks, .. }
-            | Block::Details { blocks, .. }
-            | Block::FencedDiv { blocks, .. }
-            | Block::Group(blocks) => fill_toc(blocks, headings),
-            _ => {}
+        if let Block::Toc(entries) = block {
+            *entries = headings.to_vec();
+        } else if let Some(inner) = block.nested_blocks_mut() {
+            fill_toc(inner, headings);
         }
     }
 }
 
+/// Parses Markdown into a [`Document`].
+///
+/// Enabled extensions: GFM tables, strikethrough, task lists, footnotes,
+/// LaTeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`), GFM alerts (`> [!NOTE]`),
+/// Obsidian callouts/wiki-links/embeds, definition lists, YAML front matter,
+/// super-/subscript, `==highlight==` and a small, safe HTML subset.
+///
+/// CRLF line endings are normalised first. The events are materialized once
+/// and walked with a cursor; the remaining stages make a bounded number of
+/// passes over the source or the block tree. The parser is deliberately total
+/// (no panics on exotic input) and guarantees progress (see the module docs).
 pub fn parse(md: &str) -> Document {
+    let md = md.replace("\r\n", "\n");
     let opts = parser_options();
-    let (front_matter, content) = extract_front_matter(md);
+    let (front_matter, content) = extract_front_matter(&md);
     let content = expand_inline_footnotes(&content);
 
     // Some constructs are easier (and safer) to protect before pulldown-cmark
@@ -888,7 +915,7 @@ pub fn parse(md: &str) -> Document {
         footnotes: BTreeMap::new(),
         metadata: front_matter,
     };
-    let mut blocks = w.blocks();
+    let mut blocks = w.document();
     let headings = collect_headings(&blocks);
     fill_toc(&mut blocks, &headings);
     postprocess_blocks(&mut blocks);
@@ -900,7 +927,7 @@ pub fn parse(md: &str) -> Document {
     for f in w.footnotes.values_mut() {
         assign_footnote_numbers(f, &footnote_numbers);
     }
-    let block_lines = source_lines(&blocks, md);
+    let block_lines = source_lines(&blocks, &md);
     let title = blocks
         .iter()
         .find_map(|b| {
@@ -918,11 +945,6 @@ pub fn parse(md: &str) -> Document {
                 .find(|(k, v)| k.eq_ignore_ascii_case("title") && !v.trim().is_empty())
                 .map(|(_, v)| v.trim().to_string())
         });
-    let footnote_numbers = collect_footnote_numbers(&blocks, &w.footnotes);
-    assign_footnote_numbers(&mut blocks, &footnote_numbers);
-    for f in w.footnotes.values_mut() {
-        assign_footnote_numbers(f, &footnote_numbers);
-    }
     Document {
         title,
         blocks,
@@ -1070,28 +1092,57 @@ const DIV_LANG: &str = "mdviewer-div";
 /// Placeholder fenced language for `[TOC]`.
 const TOC_LANG: &str = "mdviewer-toc";
 
+/// Tracks fenced code blocks (``` or ~~~) over the lines of a Markdown source.
+///
+/// A closing fence must be at least as long as the opening one and carry no
+/// info string, as in CommonMark.
+#[derive(Default)]
+pub(crate) struct FenceTracker {
+    open: Option<(char, usize)>,
+}
+
+impl FenceTracker {
+    /// Consumes one line and returns `true` if it belongs to a fenced code
+    /// block, fence lines included.
+    pub(crate) fn feed(&mut self, line: &str) -> bool {
+        let Some((c, n, info)) = fence_marker(line) else {
+            return self.open.is_some();
+        };
+        match self.open {
+            Some((fc, fn_)) if fc == c && n >= fn_ && info.is_empty() => self.open = None,
+            None => self.open = Some((c, n)),
+            Some(_) => {}
+        }
+        true
+    }
+}
+
+/// A `~` fence longer than any tilde fence inside `lines`, so a sentinel block
+/// wrapping other sentinel blocks (display math inside `<details>`, a fenced
+/// code block inside a div) only closes at its own closing fence.
+fn sentinel_fence<'a>(lines: impl IntoIterator<Item = &'a str>) -> String {
+    let longest = lines
+        .into_iter()
+        .filter_map(fence_marker)
+        .filter(|(c, _, _)| *c == '~')
+        .map(|(_, n, _)| n)
+        .max()
+        .unwrap_or(0);
+    "~".repeat(longest.max(3) + 1)
+}
+
 /// Converts Pandoc/Quarto fenced divs (`::: warning … :::`) into sentinel
-/// fenced blocks understood by [`Walker::code_block`].
+/// fenced blocks understood by [`Walker::code_block`]. Divs may nest; the
+/// body of each div is converted when it is parsed.
 fn protect_fenced_divs(markdown: &str) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut out = String::with_capacity(markdown.len() + 32);
     let mut i = 0usize;
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
 
     while i < lines.len() {
         let line = lines[i];
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            out.push('\n');
-            i += 1;
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             out.push('\n');
             i += 1;
@@ -1105,20 +1156,30 @@ fn protect_fenced_divs(markdown: &str) -> String {
         {
             let info = trimmed[3..].trim().to_string();
             let mut body: Vec<&str> = Vec::new();
+            let mut body_fence = FenceTracker::default();
+            let mut depth = 0usize;
             let mut j = i + 1;
             let mut closed = false;
             while j < lines.len() {
                 let candidate = lines[j].trim();
-                if !candidate.is_empty() && candidate.chars().all(|c| c == ':') {
-                    closed = true;
-                    j += 1;
-                    break;
+                if !body_fence.feed(lines[j]) {
+                    if !candidate.is_empty() && candidate.chars().all(|c| c == ':') {
+                        if depth == 0 {
+                            closed = true;
+                            j += 1;
+                            break;
+                        }
+                        depth -= 1;
+                    } else if candidate.starts_with(":::") && !candidate[3..].trim().is_empty() {
+                        depth += 1;
+                    }
                 }
                 body.push(lines[j]);
                 j += 1;
             }
             if closed {
-                out.push_str("```");
+                let marker = sentinel_fence(body.iter().copied());
+                out.push_str(&marker);
                 out.push_str(DIV_LANG);
                 out.push('\n');
                 out.push_str(&info);
@@ -1127,7 +1188,8 @@ fn protect_fenced_divs(markdown: &str) -> String {
                     out.push_str(line);
                     out.push('\n');
                 }
-                out.push_str("```\n");
+                out.push_str(&marker);
+                out.push('\n');
                 i = j;
                 continue;
             }
@@ -1145,22 +1207,11 @@ pub(crate) fn convert_admonitions(markdown: &str) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut out = String::with_capacity(markdown.len() + 32);
     let mut i = 0usize;
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
 
     while i < lines.len() {
         let line = lines[i];
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            out.push('\n');
-            i += 1;
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             out.push('\n');
             i += 1;
@@ -1181,7 +1232,7 @@ pub(crate) fn convert_admonitions(markdown: &str) -> String {
                 "INFO" | "ABSTRACT" | "SUMMARY" | "TLDR" => "NOTE",
                 "HINT" => "TIP",
                 "CHECK" | "DONE" => "SUCCESS",
-                "FAIL" | "MISSING" | "ERROR" => "FAILURE",
+                "FAIL" | "MISSING" => "FAILURE",
                 other if AlertKind::from_marker(other).is_some() => other,
                 _ => "NOTE",
             };
@@ -1235,29 +1286,16 @@ pub(crate) fn convert_admonitions(markdown: &str) -> String {
     out
 }
 
-/// Replaces Markdown-Extra abbreviation definitions with inline `<abbr>`
-/// elements in the prose. Definitions are removed from the output.
 /// Converts simple Pandoc grid tables (`+---+---+`) into GFM pipe tables.
 /// Multi-line cells and row spans are not reconstructed.
 pub(crate) fn convert_grid_tables(markdown: &str) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut out = String::with_capacity(markdown.len());
     let mut i = 0usize;
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     while i < lines.len() {
         let line = lines[i];
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            out.push('\n');
-            i += 1;
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             out.push('\n');
             i += 1;
@@ -1271,66 +1309,54 @@ pub(crate) fn convert_grid_tables(markdown: &str) -> String {
         if is_border {
             let mut rows: Vec<Vec<String>> = Vec::new();
             let mut j = i + 1;
-            let mut header_boundary = false;
-            let mut valid = true;
             while j < lines.len() {
                 let candidate = lines[j].trim();
                 if candidate.starts_with('+')
                     && candidate.chars().all(|c| matches!(c, '+' | '-' | '='))
                 {
-                    if candidate.contains('=') {
-                        header_boundary = true;
-                    }
                     j += 1;
                     continue;
                 }
                 if candidate.starts_with('|') {
-                    let cells = candidate
-                        .trim_matches('|')
-                        .split('|')
-                        .map(|cell| cell.trim().replace('|', "\\|"))
-                        .collect::<Vec<_>>();
-                    if cells.is_empty() {
-                        valid = false;
-                        break;
-                    }
-                    rows.push(cells);
+                    rows.push(
+                        candidate
+                            .trim_matches('|')
+                            .split('|')
+                            .map(|cell| cell.trim().to_string())
+                            .collect(),
+                    );
                     j += 1;
                     continue;
                 }
                 break;
             }
-            if valid && !rows.is_empty() {
+            if !rows.is_empty() {
                 let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-                if columns > 0 {
-                    let header_index = 0usize;
-                    let header = &rows[header_index];
+                let header = &rows[0];
+                out.push('|');
+                for column in 0..columns {
+                    out.push(' ');
+                    out.push_str(header.get(column).map(String::as_str).unwrap_or(""));
+                    out.push_str(" |");
+                }
+                out.push('\n');
+                out.push('|');
+                for _ in 0..columns {
+                    out.push_str(" --- |");
+                }
+                out.push('\n');
+                for row in rows.iter().skip(1) {
                     out.push('|');
                     for column in 0..columns {
                         out.push(' ');
-                        out.push_str(header.get(column).map(String::as_str).unwrap_or(""));
+                        out.push_str(row.get(column).map(String::as_str).unwrap_or(""));
                         out.push_str(" |");
                     }
                     out.push('\n');
-                    out.push('|');
-                    for _ in 0..columns {
-                        out.push_str(" --- |");
-                    }
-                    out.push('\n');
-                    for row in rows.iter().skip(header_index + 1) {
-                        out.push('|');
-                        for column in 0..columns {
-                            out.push(' ');
-                            out.push_str(row.get(column).map(String::as_str).unwrap_or(""));
-                            out.push_str(" |");
-                        }
-                        out.push('\n');
-                    }
-                    i = j;
-                    continue;
                 }
+                i = j;
+                continue;
             }
-            let _ = header_boundary;
         }
         out.push_str(line);
         out.push('\n');
@@ -1339,32 +1365,29 @@ pub(crate) fn convert_grid_tables(markdown: &str) -> String {
     out
 }
 
+/// Replaces Markdown-Extra abbreviation definitions (`*[HTML]: HyperText …`)
+/// with `<abbr>` elements in the prose and removes the definitions. Matches
+/// are whole words and are not replaced inside code, HTML tags, `$…$` math or
+/// link destinations.
 pub(crate) fn preprocess_abbreviations(markdown: &str) -> String {
     let mut definitions: Vec<(String, String)> = Vec::new();
     let mut content = String::with_capacity(markdown.len());
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     for line in markdown.split_inclusive('\n') {
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
+        if fence.feed(line) {
             content.push_str(line);
             continue;
         }
-        if fence.is_none() {
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("*[")
-                && let Some(end) = rest.find("]:")
-            {
-                let key = rest[..end].trim();
-                let title = rest[end + 2..].trim().trim_end_matches('\n');
-                if !key.is_empty() && !title.is_empty() {
-                    definitions.push((key.to_string(), title.to_string()));
-                }
-                continue;
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("*[")
+            && let Some(end) = rest.find("]:")
+        {
+            let key = rest[..end].trim();
+            let title = rest[end + 2..].trim().trim_end_matches('\n');
+            if !key.is_empty() && !title.is_empty() {
+                definitions.push((key.to_string(), title.to_string()));
             }
+            continue;
         }
         content.push_str(line);
     }
@@ -1372,20 +1395,15 @@ pub(crate) fn preprocess_abbreviations(markdown: &str) -> String {
         return content;
     }
     definitions.sort_by_key(|(key, _)| std::cmp::Reverse(key.chars().count()));
+    let compiled: Vec<(Vec<char>, &str, &str)> = definitions
+        .iter()
+        .map(|(key, title)| (key.chars().collect(), key.as_str(), title.as_str()))
+        .collect();
 
     let mut out = String::with_capacity(content.len() + 32);
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     for line in content.split_inclusive('\n') {
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             continue;
         }
@@ -1394,6 +1412,8 @@ pub(crate) fn preprocess_abbreviations(markdown: &str) -> String {
         let mut i = 0usize;
         let mut in_code = false;
         let mut in_tag = false;
+        let mut in_math = false;
+        let mut in_destination = false;
         while i < chars.len() {
             if chars[i] == '`' {
                 in_code = !in_code;
@@ -1407,11 +1427,23 @@ pub(crate) fn preprocess_abbreviations(markdown: &str) -> String {
             if !in_code && chars[i] == '>' {
                 in_tag = false;
             }
-            if !in_code && !in_tag {
+            if !in_code && chars[i] == '$' {
+                if in_math {
+                    in_math = false;
+                } else if chars[i + 1..].contains(&'$') {
+                    in_math = true;
+                }
+            }
+            if !in_code && chars[i] == ']' && chars.get(i + 1) == Some(&'(') {
+                in_destination = true;
+            }
+            if in_destination && chars[i] == ')' {
+                in_destination = false;
+            }
+            if !in_code && !in_tag && !in_math && !in_destination {
                 let mut matched = false;
-                for (key, title) in &definitions {
-                    let key_chars: Vec<char> = key.chars().collect();
-                    if chars[i..].starts_with(&key_chars) {
+                for (key_chars, key, title) in &compiled {
+                    if chars[i..].starts_with(key_chars) {
                         let previous = i.checked_sub(1).and_then(|p| chars.get(p));
                         let next = chars.get(i + key_chars.len());
                         let boundary =
@@ -1447,8 +1479,10 @@ fn html_escape_attr(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Removes HTML comments/scripts and protects constructs that pulldown-cmark
-/// would otherwise mis-parse. Fenced code blocks are left untouched.
+/// Source-to-source passes that run before pulldown-cmark: comment and script
+/// removal, math and `[TOC]` placeholders, grid tables, abbreviations, fenced
+/// divs, admonitions and `<details>`. Fenced code blocks are left untouched by
+/// every pass.
 fn preprocess(md: &str) -> String {
     let src = strip_unsafe_html(md);
     let src = protect_inline_math(&protect_display_math(&src));
@@ -1465,18 +1499,9 @@ fn preprocess(md: &str) -> String {
 /// the formula would silently become plain text.
 fn protect_inline_math(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     for line in md.split_inclusive('\n') {
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             continue;
         }
@@ -1521,17 +1546,18 @@ fn protect_inline_math(md: &str) -> String {
 /// True if `line` starts a fenced code block (``` or ~~~) and returns the
 /// fence marker and its length.
 pub(crate) fn fence_marker_for_export(line: &str) -> Option<(char, usize)> {
-    fence_marker(line)
+    fence_marker(line).map(|(c, n, _)| (c, n))
 }
 
-fn fence_marker(line: &str) -> Option<(char, usize)> {
+/// Parses a fence line into its character, run length and info string.
+fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
     let trimmed = line.trim_start();
     let c = trimmed.chars().next()?;
     if c != '`' && c != '~' {
         return None;
     }
     let len = trimmed.chars().take_while(|&x| x == c).count();
-    (len >= 3).then_some((c, len))
+    (len >= 3).then(|| (c, len, trimmed[len..].trim()))
 }
 
 /// Removes HTML comments and `<script>`/`<style>` content outside code fences.
@@ -1540,20 +1566,11 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
 /// safe subset.
 fn strip_unsafe_html(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
-    let mut lines = md.split_inclusive('\n').peekable();
-    let mut fence: Option<(char, usize)> = None;
+    let mut lines = md.split_inclusive('\n');
+    let mut fence = FenceTracker::default();
 
     while let Some(line) = lines.next() {
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             continue;
         }
@@ -1607,21 +1624,11 @@ fn protect_display_math(md: &str) -> String {
     let mut out = String::with_capacity(md.len() + 32);
     let lines: Vec<&str> = md.split_inclusive('\n').collect();
     let mut i = 0usize;
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
 
     while i < lines.len() {
         let line = lines[i];
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
-            out.push_str(line);
-            i += 1;
-            continue;
-        }
-        if fence.is_some() {
+        if fence.feed(line) {
             out.push_str(line);
             i += 1;
             continue;
@@ -1650,36 +1657,38 @@ fn protect_display_math(md: &str) -> String {
                 continue;
             }
 
-            // Collect lines until the closing delimiter.
-            let mut chunk = String::new();
-            let mut found = false;
-            let mut j = i;
-            while j < lines.len() {
-                let l = lines[j];
-                if j == i {
-                    chunk.push_str(after_open);
-                } else if let Some(pos) = l.rfind(close) {
+            // Collect lines until the closing delimiter. Text after the
+            // delimiter on that line is kept as ordinary source.
+            let mut chunk = String::from(after_open);
+            let mut closing = None;
+            for (j, l) in lines.iter().enumerate().skip(i + 1) {
+                if let Some(pos) = l.rfind(close) {
                     chunk.push_str(&l[..pos]);
-                    found = true;
-                    i = j + 1;
+                    closing = Some((j, &l[pos + close.len()..]));
                     break;
-                } else {
-                    chunk.push_str(l);
                 }
-                j += 1;
+                chunk.push_str(l);
             }
-            if found {
-                let tex = chunk.trim();
-                if !tex.is_empty() {
-                    out.push_str(&format!("~~~~{MATH_LANG}\n{tex}\n~~~~\n"));
-                    continue;
-                }
-            } else {
+            let Some((end, rest)) = closing else {
                 // Unclosed delimiter: leave the source untouched.
                 out.push_str(line);
                 i += 1;
                 continue;
+            };
+            let tex = chunk.trim();
+            if tex.is_empty() {
+                // An empty formula produces no block; keep the line count.
+                for _ in i..=end {
+                    out.push('\n');
+                }
+            } else {
+                out.push_str(&format!("~~~~{MATH_LANG}\n{tex}\n~~~~\n"));
             }
+            if !rest.trim().is_empty() {
+                out.push_str(rest);
+            }
+            i = end + 1;
+            continue;
         }
         out.push_str(line);
         i += 1;
@@ -1690,57 +1699,49 @@ fn protect_display_math(md: &str) -> String {
 /// Replaces `<details>…</details>` with a sentinel fenced block so that its
 /// blank lines and Markdown body survive pulldown-cmark's HTML block rules.
 fn protect_details(md: &str) -> String {
+    let lower = md.to_ascii_lowercase();
     let mut out = String::with_capacity(md.len());
     let mut i = 0usize;
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     while i < md.len() {
         let line_end = md[i..].find('\n').map_or(md.len(), |p| i + p + 1);
         let line = &md[i..line_end];
-        if let Some((c, n)) = fence_marker(line) {
-            match fence {
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                None => fence = Some((c, n)),
-                _ => {}
-            }
+        if fence.feed(line) {
             out.push_str(line);
             i = line_end;
             continue;
         }
-        if fence.is_some() {
-            out.push_str(line);
-            i = line_end;
-            continue;
-        }
-        let lower_line = line.to_ascii_lowercase();
-        if let Some(rel) = lower_line.find("<details") {
+        if let Some(rel) = lower[i..line_end].find("<details") {
             let abs = i + rel;
-            let lower = md[abs..].to_ascii_lowercase();
-            if let Some(cend) = lower.find("</details>") {
+            if let Some(cend) = lower[abs..].find("</details>") {
                 let tag_end = cend + "</details>".len();
                 let block = &md[abs..abs + tag_end];
-                let open = block[..block.find('>').map_or(0, |p| p + 1)]
-                    .to_ascii_lowercase()
-                    .contains("open");
-                let inner_start = block.find('>').map_or(0, |p| p + 1);
-                let inner = &block[inner_start..block.len() - "</details>".len()];
-                let (summary, body) = split_summary(inner);
+                // The opening tag ends at the first `>` before the closing tag.
+                let open_end = block[..cend].find('>').map_or(cend, |p| p + 1);
+                let open = block[..open_end].to_ascii_lowercase().contains("open");
+                let (summary, body) = split_summary(&block[open_end..cend]);
                 let lang = if open {
                     DETAILS_OPEN_LANG
                 } else {
                     DETAILS_LANG
                 };
-                let replacement =
-                    format!("~~~~{lang}\n{}\n{}\n~~~~\n", summary.trim(), body.trim());
+                let content = format!("{}\n{}", summary.trim(), body.trim());
+                let marker = sentinel_fence(content.lines());
+                let replacement = format!("{marker}{lang}\n{content}\n{marker}\n");
                 // Pad with blank lines so the replacement occupies exactly as
                 // many source lines as the original element. The newline after
                 // `</details>` is copied separately by the outer loop, hence
                 // the `+ 1`. This keeps click-to-source line numbers correct.
-                let missing = block
-                    .matches('\n')
-                    .count()
-                    .saturating_sub(replacement.matches('\n').count())
-                    + 1;
+                let before = &md[i..abs];
+                out.push_str(before);
+                let mut newlines = replacement.matches('\n').count();
+                if !before.trim().is_empty() {
+                    // The sentinel fence must start its own line.
+                    out.push('\n');
+                    newlines += 1;
+                }
                 out.push_str(&replacement);
+                let missing = block.matches('\n').count().saturating_sub(newlines) + 1;
                 for _ in 0..missing {
                     out.push('\n');
                 }
@@ -1894,6 +1895,17 @@ impl Walker {
         out
     }
 
+    /// Top-level blocks up to the end of the event stream. A stray end tag
+    /// (unbalanced HTML) is skipped instead of hiding the rest of the document.
+    fn document(&mut self) -> Vec<Block> {
+        let mut out = self.blocks();
+        while self.peek().is_some() {
+            self.pos += 1;
+            out.extend(self.blocks());
+        }
+        out
+    }
+
     /// Handles a container start (the start event is already consumed).
     ///
     /// Returning `None` means: the tag does not produce a block of its own
@@ -1959,9 +1971,9 @@ impl Walker {
 
     /// Reads a YAML/TOML metadata block into `self.metadata`.
     ///
-    /// Only flat `key: value` pairs are interpreted; nested structures are
-    /// shown as a single indented value line. This is enough to display
-    /// Obsidian properties and static-site front matter without a YAML parser.
+    /// Fallback for metadata blocks that [`extract_front_matter`] did not
+    /// consume. Only `key: value` pairs and `- item` lines are read, and nested
+    /// keys are not prefixed, so no YAML parser is needed.
     fn metadata_block(&mut self) {
         let mut raw = String::new();
         loop {
@@ -2019,7 +2031,9 @@ impl Walker {
     /// A trailing newline is removed because the renderers work line by line.
     ///
     /// Sentinel languages injected by [`preprocess`] are translated here:
-    /// `mdviewer-math` → [`Block::Math`], `mdviewer-details` → [`Block::Details`].
+    /// `mdviewer-toc` → [`Block::Toc`], `mdviewer-div` → [`Block::FencedDiv`],
+    /// `mdviewer-math` → [`Block::Math`], `mdviewer-details` and
+    /// `mdviewer-details-open` → [`Block::Details`].
     fn code_block(&mut self, kind: CodeBlockKind<'static>) -> Block {
         let info = match &kind {
             CodeBlockKind::Fenced(info) => info.trim().to_string(),
@@ -2057,7 +2071,7 @@ impl Walker {
                 let (info, body) = code.split_once('\n').unwrap_or((&code, ""));
                 Block::FencedDiv {
                     class: info.trim().to_string(),
-                    blocks: parse(body).blocks,
+                    blocks: self.parse_nested(body),
                 }
             }
             Some(MATH_LANG) => Block::Math(code),
@@ -2072,13 +2086,23 @@ impl Walker {
                         summary
                     },
                     open: lang.as_deref() == Some(DETAILS_OPEN_LANG),
-                    blocks: parse(body).blocks,
+                    blocks: self.parse_nested(body),
                 }
             }
             Some("mermaid") => Block::Mermaid(code),
             Some("math") | Some("latex") | Some("tex") => Block::Math(code),
             _ => Block::CodeBlock { lang, code },
         }
+    }
+
+    /// Parses the body of a sentinel block as its own document. Footnote
+    /// definitions inside the body belong to the enclosing document.
+    fn parse_nested(&mut self, body: &str) -> Vec<Block> {
+        let nested = parse(body);
+        for (label, blocks) in nested.footnotes {
+            self.footnotes.entry(label).or_default().extend(blocks);
+        }
+        nested.blocks
     }
 
     /// Reads a raw HTML block.
@@ -2443,11 +2467,8 @@ impl Walker {
                                 });
                             }
                         }
-                        // Unexpected span tags: skip their content defensively.
-                        other => {
-                            let end = other.to_end();
-                            let _ = self.parse_inlines(Some(end));
-                        }
+                        // `is_span_tag` admits no other tags.
+                        _ => {}
                     }
                 }
                 Some(Event::Text(t)) => {
@@ -2535,23 +2556,6 @@ impl Walker {
                 self.skip_html_until(&format!("</{name}>"));
                 return;
             }
-            // Void/self-closing tags never have content to consume.
-            if lower.ends_with("/>")
-                || matches!(
-                    name.as_str(),
-                    "area"
-                        | "base"
-                        | "col"
-                        | "input"
-                        | "link"
-                        | "meta"
-                        | "param"
-                        | "source"
-                        | "track"
-                )
-            {
-                return;
-            }
             match name.as_str() {
                 "br" | "hr" | "wbr" => {
                     if name != "wbr" {
@@ -2563,6 +2567,20 @@ impl Walker {
                         out.push(img);
                     }
                 }
+                // Void and self-closing tags never have content to consume.
+                _ if lower.ends_with("/>")
+                    || matches!(
+                        name.as_str(),
+                        "area"
+                            | "base"
+                            | "col"
+                            | "input"
+                            | "link"
+                            | "meta"
+                            | "param"
+                            | "source"
+                            | "track"
+                    ) => {}
                 _ => {
                     let inner = self.parse_inlines_html(&name);
                     match name.as_str() {
@@ -2606,15 +2624,21 @@ impl Walker {
         }
     }
 
-    /// Consumes inline events until an HTML token that contains `marker`.
+    /// Consumes inline events up to and including the HTML token that contains
+    /// `marker`. Stops before any start or end tag without consuming it, so the
+    /// enclosing parser still sees its own boundaries.
     fn skip_html_until(&mut self, marker: &str) {
         let marker = marker.to_ascii_lowercase();
         while let Some(ev) = self.peek().cloned() {
-            self.pos += 1;
             match ev {
-                Event::InlineHtml(h) if h.to_ascii_lowercase().contains(&marker) => break,
-                Event::End(_) | Event::Start(_) => break,
-                _ => {}
+                Event::Start(_) | Event::End(_) => break,
+                Event::InlineHtml(h) => {
+                    self.pos += 1;
+                    if h.to_ascii_lowercase().contains(&marker) {
+                        break;
+                    }
+                }
+                _ => self.pos += 1,
             }
         }
     }
@@ -2647,11 +2671,37 @@ fn html_tag_name(html: &str) -> Option<(String, bool)> {
     (!name.is_empty()).then_some((name, closing))
 }
 
-/// Reads an attribute value from a raw HTML tag (case-insensitive).
+/// Lowercases a tag and blanks out the content of quoted attribute values, so
+/// attribute names are only found outside values. Byte offsets are preserved.
+fn mask_quoted_values(tag: &str) -> Option<String> {
+    let mut bytes = tag.to_ascii_lowercase().into_bytes();
+    let mut quote: Option<u8> = None;
+    let mut after_eq = false;
+    for b in bytes.iter_mut() {
+        if let Some(q) = quote {
+            if *b == q {
+                quote = None;
+            } else {
+                *b = b' ';
+            }
+        } else if after_eq && matches!(*b, b'"' | b'\'') {
+            quote = Some(*b);
+        }
+        after_eq = match *b {
+            b'=' => true,
+            c if c.is_ascii_whitespace() => after_eq,
+            _ => false,
+        };
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Reads an attribute value from a raw HTML tag (case-insensitive). Names that
+/// occur inside quoted values are ignored.
 fn html_attr(tag: &str, attr: &str) -> Option<String> {
-    // `to_ascii_lowercase` preserves byte offsets, so we can search the lower
-    // copy and slice the original tag (keeping attribute values verbatim).
-    let lower = tag.to_ascii_lowercase();
+    // The masked copy keeps byte offsets, so attribute names are located in it
+    // and values are sliced from the original tag verbatim.
+    let lower = mask_quoted_values(tag)?;
     let mut start = 0usize;
     while let Some(pos) = lower[start..].find(attr) {
         let abs = start + pos;
@@ -2844,12 +2894,14 @@ fn convert_html_block_tag(
             let mut blocks = Vec::new();
             convert_html_children(parser, tag.children().top().as_slice(), &mut blocks);
             if !blocks.is_empty() {
-                out.push(Block::BlockQuote {
+                let mut quote = Block::BlockQuote {
                     kind: None,
                     title: None,
                     fold: None,
                     blocks,
-                });
+                };
+                apply_callout(&mut quote);
+                out.push(quote);
             }
         }
         "pre" => out.push(html_pre(parser, tag)),
@@ -2859,19 +2911,22 @@ fn convert_html_block_tag(
                 out.push(Block::Table { aligns, head, rows });
             }
         }
-        "details" => {
-            if let Some(details) = html_details(parser, tag) {
-                out.push(details);
-            }
-        }
+        "details" => out.push(html_details(parser, tag)),
         // Containers (`div`, `section`, `figure`, `li`, unknown block tags)
         // are flattened: their children inherit the surrounding flow.
         _ => convert_html_children(parser, tag.children().top().as_slice(), out),
     }
 }
 
-/// Converts an HTML `<ul>`/`<ol>` into a list block.
+/// Converts an HTML `<ul>`/`<ol>` into a list block. `<ol start="n">` sets the
+/// first number.
 fn html_list(parser: &tl::Parser<'_>, tag: &tl::HTMLTag<'_>, ordered: bool) -> Option<Block> {
+    let start = tag
+        .attributes()
+        .get("start")
+        .flatten()
+        .and_then(|value| value.as_utf8_str().trim().parse::<u64>().ok())
+        .unwrap_or(1);
     let mut items = Vec::new();
     for &handle in tag.children().top().as_slice() {
         let Some(node) = handle.get(parser) else {
@@ -2892,7 +2947,7 @@ fn html_list(parser: &tl::Parser<'_>, tag: &tl::HTMLTag<'_>, ordered: bool) -> O
     }
     Some(Block::List {
         ordered,
-        start: 1,
+        start,
         tight: true,
         items,
     })
@@ -2939,7 +2994,7 @@ fn html_pre(parser: &tl::Parser<'_>, tag: &tl::HTMLTag<'_>) -> Block {
 }
 
 /// Converts an HTML `<details>` element (summary + body blocks).
-fn html_details(parser: &tl::Parser<'_>, tag: &tl::HTMLTag<'_>) -> Option<Block> {
+fn html_details(parser: &tl::Parser<'_>, tag: &tl::HTMLTag<'_>) -> Block {
     let mut summary = "Details".to_string();
     let mut body: Vec<tl::NodeHandle> = Vec::new();
     for &handle in tag.children().top().as_slice() {
@@ -2961,11 +3016,11 @@ fn html_details(parser: &tl::Parser<'_>, tag: &tl::HTMLTag<'_>) -> Option<Block>
     }
     let mut blocks = Vec::new();
     convert_html_children(parser, &body, &mut blocks);
-    Some(Block::Details {
+    Block::Details {
         summary,
         open: tag.attributes().contains("open"),
         blocks,
-    })
+    }
 }
 
 /// Converts a raw HTML block into regular blocks when only supported markup
@@ -2985,7 +3040,9 @@ fn decode_html_entities(text: &str) -> String {
     while let Some(start) = rest.find('&') {
         out.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let Some(end) = tail.find(';').filter(|end| *end <= 12) else {
+        // Only the first 13 bytes can hold a short entity; scanning further
+        // would make every `&` in a long text quadratic.
+        let Some(end) = tail.as_bytes().iter().take(13).position(|&b| b == b';') else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -3001,6 +3058,15 @@ fn decode_html_entities(text: &str) -> String {
             "mdash" => Some('\u{2014}'),
             "ndash" => Some('\u{2013}'),
             "hellip" => Some('\u{2026}'),
+            "lsquo" => Some('\u{2018}'),
+            "rsquo" => Some('\u{2019}'),
+            "ldquo" => Some('\u{201c}'),
+            "rdquo" => Some('\u{201d}'),
+            "bull" => Some('\u{2022}'),
+            "middot" => Some('\u{b7}'),
+            "euro" => Some('\u{20ac}'),
+            "larr" => Some('\u{2190}'),
+            "rarr" => Some('\u{2192}'),
             "copy" => Some('\u{a9}'),
             "reg" => Some('\u{ae}'),
             "trade" => Some('\u{2122}'),
@@ -3033,23 +3099,8 @@ fn decode_html_entities(text: &str) -> String {
 /// Rasterizes a safe SVG block to a PNG data URI (scripts are never executed
 /// by resvg). Returns `None` for unsupported SVG.
 pub(crate) fn svg_to_png_data_uri(svg: &str) -> Option<String> {
-    let mut options = resvg::usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
-    let natural = tree.size();
-    if natural.width() <= 0.0 || natural.height() <= 0.0 {
-        return None;
-    }
-    let scale = 2.0f32.min(2000.0 / natural.width().max(1.0));
-    let w = (natural.width() * scale).ceil().max(1.0) as u32;
-    let h = (natural.height() * scale).ceil().max(1.0) as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-    let png = pixmap.encode_png().ok()?;
+    let raster = crate::svg::rasterize(svg, 2.0, 2000.0)?;
+    let png = raster.pixmap.encode_png().ok()?;
     Some(format!(
         "data:image/png;base64,{}",
         crate::html_export::base64_encode(&png)
@@ -3058,14 +3109,19 @@ pub(crate) fn svg_to_png_data_uri(svg: &str) -> Option<String> {
 
 /// Builds an image inline from a raw `<img …>` tag.
 fn parse_html_img(tag: &str) -> Option<Inline> {
-    let url = html_attr(tag, "src")?;
-    if url.trim().is_empty() {
+    let url = html_attr(tag, "src")?.trim().to_string();
+    if url.is_empty() {
         return None;
     }
     let alt = html_attr(tag, "alt").unwrap_or_default();
     let title = html_attr(tag, "title");
-    let width = html_attr(tag, "width").and_then(|v| v.trim_end_matches("px").parse().ok());
-    let height = html_attr(tag, "height").and_then(|v| v.trim_end_matches("px").parse().ok());
+    let dimension = |name: &str| {
+        html_attr(tag, name)
+            .and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+    };
+    let width = dimension("width");
+    let height = dimension("height");
     Some(Inline::Image {
         alt,
         url,
@@ -3092,20 +3148,19 @@ fn parse_html_image_wrapper(html: &str) -> Option<(Inline, bool)> {
     let before = html[..start].trim();
     let after = html[img_end..].trim();
 
-    // Only allow container tags around the image (no surrounding prose).
-    let is_container = |s: &str, name: &str| {
-        let s = s.to_ascii_lowercase();
-        s.starts_with(&format!("<{name}")) || s.starts_with(&format!("</{name}"))
+    // Only container tags may surround the image: no text, no other elements.
+    let is_wrapper = |s: &str| {
+        strip_tags(s).trim().is_empty()
+            && s.split('<').skip(1).all(|tag| {
+                let name: String = tag
+                    .trim_start_matches('/')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                matches!(name.to_ascii_lowercase().as_str(), "p" | "div" | "picture")
+            })
     };
-    let before_ok = before.is_empty()
-        || is_container(before, "p")
-        || is_container(before, "div")
-        || is_container(before, "picture");
-    let after_ok = after.is_empty()
-        || is_container(after, "p")
-        || is_container(after, "div")
-        || is_container(after, "picture");
-    if !before_ok || !after_ok || after.to_ascii_lowercase().contains("<img") {
+    if !is_wrapper(before) || !is_wrapper(after) {
         return None;
     }
 
@@ -3180,8 +3235,7 @@ fn parse_html_table(html: &str) -> Option<HtmlTable> {
             cell_pos = cstart + cend_rel + close.len();
         }
         if !row.is_empty() {
-            let in_head = thead.is_some_and(|(s, e)| tr_start >= s && tr_start < e)
-                || (thead.is_none() && head.is_empty() && rows.is_empty());
+            let in_head = thead.is_some_and(|(s, e)| tr_start >= s && tr_start < e);
             if in_head {
                 head.push(row);
             } else {
@@ -3203,10 +3257,13 @@ fn parse_html_table(html: &str) -> Option<HtmlTable> {
     Some((vec![align.unwrap_or(TableAlign::None); ncols], head, rows))
 }
 
-/// Parses an inline Markdown/HTML fragment (used for HTML table cells).
+/// Parses an inline Markdown/HTML fragment: HTML table cells, headings,
+/// paragraphs and inline tags inside HTML blocks.
 ///
 /// Reuses the normal inline event walker, so nested Markdown, `<b>`/`<i>`
-/// styling, code, math, links and images all keep working inside cells.
+/// styling, code, math, links and images all keep working. Text-level
+/// extensions are not applied here; the enclosing document's
+/// [`postprocess_blocks`] pass covers the returned inlines.
 fn parse_inline_fragment(src: &str) -> Vec<Inline> {
     let src = strip_unsafe_html(src);
     let raw: Vec<Event<'static>> = Parser::new_ext(&src, parser_options())
@@ -3228,7 +3285,6 @@ fn parse_inline_fragment(src: &str) -> Vec<Inline> {
         metadata: Vec::new(),
     };
     let mut inlines = w.parse_inlines(None);
-    postprocess_inlines(&mut inlines, true);
     if inlines.is_empty() {
         let text = strip_tags(&src).trim().to_string();
         if !text.is_empty() {
@@ -3429,17 +3485,18 @@ fn is_image_target(url: &str) -> bool {
 // Post-processing (text-level extensions)
 // ---------------------------------------------------------------------------
 
-/// Applies text-level extensions to every inline vector of a block tree:
-/// `==highlight==`, Obsidian comments/embeds, `\(…\)` math and bare URLs.
+/// Applies text-level extensions to every inline run of a block tree
+/// (`==highlight==`, Obsidian comments/embeds, `\(…\)` math, bare URLs). It
+/// then drops paragraphs that became empty and finalizes soft line breaks.
 fn postprocess_blocks(blocks: &mut Vec<Block>) {
     for block in blocks.iter_mut() {
+        if let Some(inner) = block.nested_blocks_mut() {
+            postprocess_blocks(inner);
+        }
         match block {
             Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
                 postprocess_inlines(inlines, true)
             }
-            Block::BlockQuote { blocks, .. }
-            | Block::Group(blocks)
-            | Block::FencedDiv { blocks, .. } => postprocess_blocks(blocks),
             Block::List { items, .. } => {
                 for item in items {
                     postprocess_blocks(&mut item.blocks);
@@ -3460,15 +3517,19 @@ fn postprocess_blocks(blocks: &mut Vec<Block>) {
                     }
                 }
             }
-            Block::Details { blocks, .. } => postprocess_blocks(blocks),
-            Block::Toc(_) | Block::Media { .. } | Block::Image { .. } => {}
-            Block::Math(_)
+            Block::BlockQuote { .. }
+            | Block::Details { .. }
+            | Block::FencedDiv { .. }
+            | Block::Group(_)
+            | Block::Toc(_)
+            | Block::Media { .. }
+            | Block::Image { .. }
+            | Block::Math(_)
             | Block::Mermaid(_)
             | Block::CodeBlock { .. }
             | Block::Html(_)
             | Block::Rule => {}
         }
-        apply_callout(block);
     }
     // Text-level extensions may have removed the only text (HTML comments,
     // Obsidian comments); drop the resulting empty paragraphs.
@@ -3489,26 +3550,16 @@ fn normalize_soft_breaks(blocks: &mut [Block]) {
                 Inline::Text(t) if t.contains(SOFT_BREAK) => {
                     *t = t.replace(SOFT_BREAK, "\n");
                 }
-                Inline::Emph(v)
-                | Inline::Strong(v)
-                | Inline::Strike(v)
-                | Inline::Highlight(v)
-                | Inline::Underline(v)
-                | Inline::Kbd(v)
-                | Inline::Super(v)
-                | Inline::Sub(v) => inlines(v),
-                Inline::Link { inlines: v, .. } => inlines(v),
-                _ => {}
+                _ => inlines(i.children_mut()),
             }
         }
     }
     for b in blocks.iter_mut() {
+        if let Some(inner) = b.nested_blocks_mut() {
+            normalize_soft_breaks(inner);
+        }
         match b {
             Block::Heading { inlines: v, .. } | Block::Paragraph(v) => inlines(v),
-            Block::BlockQuote { blocks, .. }
-            | Block::Details { blocks, .. }
-            | Block::FencedDiv { blocks, .. }
-            | Block::Group(blocks) => normalize_soft_breaks(blocks),
             Block::List { items, .. } => {
                 for i in items {
                     normalize_soft_breaks(&mut i.blocks);
@@ -3557,15 +3608,14 @@ fn postprocess_inlines(inlines: &mut Vec<Inline>, linkify: bool) {
             other => inlines.push(other),
         }
     }
-    // Obsidian block ids (` ^abc123`) are metadata, not visible text.
+    // Obsidian block ids (` ^abc123`) are metadata, not visible text. Only an
+    // id at the very end of the text counts.
     if let Some(Inline::Text(text)) = inlines.last_mut() {
         let trimmed = text.trim_end();
         if let Some(start) = trimmed.rfind('^') {
             let id = &trimmed[start + 1..];
             if !id.is_empty()
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
                 && trimmed[..start].ends_with(char::is_whitespace)
             {
                 *text = trimmed[..start].trim_end().to_string();
@@ -3753,8 +3803,13 @@ fn expand_text(text: &str, linkify: bool) -> Vec<Inline> {
                     continue;
                 }
             }
-            // Bare e-mail address.
-            if let Some((email, len)) = match_email(rest) {
+            // Bare e-mail address. Only attempted at the start of a word, so
+            // long tokens are not rescanned from every position.
+            let word_start = !text[..i]
+                .chars()
+                .next_back()
+                .is_some_and(is_email_local_char);
+            if word_start && let Some((email, len)) = match_email(rest) {
                 flush!();
                 out.push(Inline::Link {
                     inlines: vec![Inline::Text(email.clone())],
@@ -3774,15 +3829,17 @@ fn expand_text(text: &str, linkify: bool) -> Vec<Inline> {
     out
 }
 
+fn is_email_local_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+}
+
 /// Matches a bare e-mail address at the start of `s`.
 fn match_email(s: &str) -> Option<(String, usize)> {
     let first = s.chars().next()?;
     if !first.is_ascii_alphanumeric() {
         return None;
     }
-    let local_end = s
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')))
-        .unwrap_or(s.len());
+    let local_end = s.find(|c: char| !is_email_local_char(c)).unwrap_or(s.len());
     if s.as_bytes().get(local_end) != Some(&b'@') {
         return None;
     }
@@ -3790,14 +3847,13 @@ fn match_email(s: &str) -> Option<(String, usize)> {
     let domain_len = s[domain_start..]
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
         .unwrap_or(s.len() - domain_start);
-    if domain_len == 0 || !s[domain_start..domain_start + domain_len].contains('.') {
+    // A trailing sentence period is not part of the address, so it must not
+    // count as the dot of the domain either (`a@b. Thanks` is not an address).
+    let domain = s[domain_start..domain_start + domain_len].trim_end_matches('.');
+    if !domain.contains('.') {
         return None;
     }
-    let mut len = domain_start + domain_len;
-    // A trailing sentence period is not part of the address.
-    while len > domain_start && s.as_bytes()[len - 1] == b'.' {
-        len -= 1;
-    }
+    let len = domain_start + domain.len();
     Some((s[..len].to_string(), len))
 }
 
@@ -3850,15 +3906,12 @@ fn apply_callout(block: &mut Block) {
         None => (rest.trim().to_string(), String::new()),
     };
 
-    // Keep any text before the marker (normally only whitespace) and the body
-    // that followed on subsequent lines.
-    let prefix = &text[..text.len() - trimmed.len()];
-    let replacement = format!("{prefix}{}", body.trim_start());
-    let replacement = replacement.trim_start().to_string();
-    if replacement.trim().is_empty() {
+    // What remains of the first text run is the body that followed the marker
+    // line; an empty remainder removes the run.
+    if body.trim().is_empty() {
         inlines.remove(0);
     } else {
-        *text = replacement;
+        *text = body;
     }
     if inlines.is_empty() {
         blocks.remove(0);
@@ -3870,8 +3923,9 @@ fn apply_callout(block: &mut Block) {
     *fold = folded;
 }
 
-/// Numbers footnotes in first-reference order; unreferenced definitions are
-/// appended afterwards so their content is still visible.
+/// Numbers footnotes in the order their first reference appears in the block
+/// tree. Definitions that are never referenced are appended afterwards, in
+/// label order, so their content is still visible.
 fn collect_footnote_numbers(
     blocks: &[Block],
     footnotes: &BTreeMap<String, Vec<Block>>,
@@ -3879,12 +3933,12 @@ fn collect_footnote_numbers(
     let mut map: BTreeMap<String, usize> = BTreeMap::new();
     fn walk(blocks: &[Block], map: &mut BTreeMap<String, usize>) {
         for b in blocks {
+            if let Some(inner) = b.nested_blocks() {
+                walk(inner, map);
+            }
             match b {
                 Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
                     walk_inlines(inlines, map);
-                }
-                Block::BlockQuote { blocks, .. } | Block::Details { blocks, .. } => {
-                    walk(blocks, map)
                 }
                 Block::List { items, .. } => {
                     for i in items {
@@ -3912,22 +3966,11 @@ fn collect_footnote_numbers(
     }
     fn walk_inlines(inlines: &[Inline], map: &mut BTreeMap<String, usize>) {
         for i in inlines {
-            match i {
-                Inline::FootnoteRef { label, .. } => {
-                    let next = map.len() + 1;
-                    map.entry(label.clone()).or_insert(next);
-                }
-                Inline::Emph(v)
-                | Inline::Strong(v)
-                | Inline::Strike(v)
-                | Inline::Highlight(v)
-                | Inline::Underline(v)
-                | Inline::Kbd(v)
-                | Inline::Super(v)
-                | Inline::Sub(v) => walk_inlines(v, map),
-                Inline::Link { inlines, .. } => walk_inlines(inlines, map),
-                _ => {}
+            if let Inline::FootnoteRef { label, .. } = i {
+                let next = map.len() + 1;
+                map.entry(label.clone()).or_insert(next);
             }
+            walk_inlines(i.children(), map);
         }
     }
     walk(blocks, &mut map);
@@ -3941,12 +3984,12 @@ fn collect_footnote_numbers(
 /// Writes the freshly computed footnote numbers back into all references.
 fn assign_footnote_numbers(blocks: &mut [Block], numbers: &BTreeMap<String, usize>) {
     for b in blocks.iter_mut() {
+        if let Some(inner) = b.nested_blocks_mut() {
+            assign_footnote_numbers(inner, numbers);
+        }
         match b {
             Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
                 assign_in(inlines, numbers)
-            }
-            Block::BlockQuote { blocks, .. } | Block::Details { blocks, .. } => {
-                assign_footnote_numbers(blocks, numbers)
             }
             Block::List { items, .. } => {
                 for i in items {
@@ -3973,21 +4016,10 @@ fn assign_footnote_numbers(blocks: &mut [Block], numbers: &BTreeMap<String, usiz
     }
     fn assign_in(inlines: &mut [Inline], numbers: &BTreeMap<String, usize>) {
         for i in inlines.iter_mut() {
-            match i {
-                Inline::FootnoteRef { label, number } => {
-                    *number = numbers.get(label).copied().unwrap_or(0);
-                }
-                Inline::Emph(v)
-                | Inline::Strong(v)
-                | Inline::Strike(v)
-                | Inline::Highlight(v)
-                | Inline::Underline(v)
-                | Inline::Kbd(v)
-                | Inline::Super(v)
-                | Inline::Sub(v) => assign_in(v, numbers),
-                Inline::Link { inlines, .. } => assign_in(inlines, numbers),
-                _ => {}
+            if let Inline::FootnoteRef { label, number } = i {
+                *number = numbers.get(label).copied().unwrap_or(0);
             }
+            assign_in(i.children_mut(), numbers);
         }
     }
 }
@@ -4541,7 +4573,6 @@ mod coverage_tests {
             Inline::Tag(_) => "tag",
             Inline::Citation(_) => "citation",
             Inline::Abbr { .. } => "abbr",
-            Inline::RawHtml(_) => "raw_html",
             Inline::Super(_) => "super",
             Inline::Sub(_) => "sub",
         }
@@ -4550,18 +4581,7 @@ mod coverage_tests {
     fn walk_inlines(inlines: &[Inline], seen: &mut BTreeSet<&'static str>) {
         for inline in inlines {
             seen.insert(inline_kind(inline));
-            match inline {
-                Inline::Emph(c)
-                | Inline::Strong(c)
-                | Inline::Strike(c)
-                | Inline::Highlight(c)
-                | Inline::Underline(c)
-                | Inline::Kbd(c)
-                | Inline::Super(c)
-                | Inline::Sub(c) => walk_inlines(c, seen),
-                Inline::Link { inlines, .. } => walk_inlines(inlines, seen),
-                _ => {}
-            }
+            walk_inlines(inline.children(), seen);
         }
     }
 
@@ -4608,9 +4628,9 @@ mod coverage_tests {
     }
 
     /// The bundled feature documents must exercise every construct the parser
-    /// can produce (except the reserved `Inline::RawHtml`). If a new feature
-    /// is added without a fixture, this test fails and points at what is
-    /// missing — manual checklists can then never silently fall behind.
+    /// can produce. If a new feature is added without a fixture, this test
+    /// fails and points at what is missing — manual checklists can then never
+    /// silently fall behind.
     #[test]
     fn feature_corpus_exercises_every_variant() {
         let corpus = [
@@ -5085,5 +5105,284 @@ mod extended_tests {
                 Inline::Math { tex, display: false } if tex.contains("a^2")
             ))
         )));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn summaries(doc: &Document) -> Vec<String> {
+        doc.blocks.iter().map(Block::summarize).collect()
+    }
+
+    fn links(text: &str) -> Vec<String> {
+        expand_text(text, true)
+            .into_iter()
+            .filter_map(|i| match i {
+                Inline::Link { url, .. } => Some(url),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_display_math_keeps_following_content() {
+        let doc = parse("$$\n$$\n\nAfter the formula.\n\n\\[\n\\]\n\nAfter again.\n");
+        let texts = summaries(&doc);
+        assert!(
+            texts.contains(&"After the formula.".to_string()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"After again.".to_string()), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("$$") || t.contains("\\[")));
+    }
+
+    #[test]
+    fn text_after_closing_math_delimiter_is_kept() {
+        let doc = parse("$$\nx = 1\n$$ more text\n\n\\[\ny\n\\] tail\n");
+        let texts = summaries(&doc);
+        assert!(texts.iter().any(|t| t.trim() == "more text"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.trim() == "tail"), "{texts:?}");
+    }
+
+    #[test]
+    fn text_before_details_on_the_same_line_is_kept() {
+        let doc = parse("Intro <details><summary>S</summary>Body</details>\n");
+        assert!(
+            summaries(&doc).iter().any(|t| t.trim() == "Intro"),
+            "{:?}",
+            summaries(&doc)
+        );
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Details { summary, .. } if summary == "S"))
+        );
+    }
+
+    #[test]
+    fn malformed_details_tag_does_not_panic() {
+        let doc = parse("<details</details>\n\nAfter\n");
+        assert!(summaries(&doc).contains(&"After".to_string()));
+    }
+
+    #[test]
+    fn void_and_self_closing_inline_tags_are_kept() {
+        let doc = parse("a <br/> b <br /> c <img src=\"x.png\" /> d\n");
+        let Block::Paragraph(inl) = &doc.blocks[0] else {
+            panic!("expected paragraph, got {:?}", doc.blocks);
+        };
+        let breaks: usize = inl
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Text(t) => Some(t.matches('\n').count()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(breaks, 2);
+        assert!(
+            inl.iter()
+                .any(|i| matches!(i, Inline::Image { url, .. } if url == "x.png"))
+        );
+    }
+
+    #[test]
+    fn fence_inside_fenced_div_does_not_end_the_div() {
+        let doc = parse("::: note\n```rust\nfn x() {}\n```\n:::\n\nAfter\n");
+        let Block::FencedDiv { class, blocks } = &doc.blocks[0] else {
+            panic!("expected fenced div, got {:?}", doc.blocks);
+        };
+        assert_eq!(class, "note");
+        assert!(matches!(blocks[0], Block::CodeBlock { .. }));
+        assert!(summaries(&doc).contains(&"After".to_string()));
+    }
+
+    #[test]
+    fn nested_fenced_divs_are_converted() {
+        let doc = parse("::: note\nOuter\n::: tip\nInner\n:::\nAfter inner\n:::\n\nAfter\n");
+        let Block::FencedDiv { blocks, .. } = &doc.blocks[0] else {
+            panic!("expected fenced div, got {:?}", doc.blocks);
+        };
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, Block::FencedDiv { class, .. } if class == "tip"))
+        );
+        assert!(summaries(&doc).contains(&"After".to_string()));
+    }
+
+    #[test]
+    fn fence_tracker_requires_a_bare_closing_fence() {
+        let mut fence = FenceTracker::default();
+        assert!(fence.feed("```\n"));
+        assert!(fence.feed("[TOC]\n"));
+        assert!(fence.feed("```rust\n"));
+        assert!(fence.feed("```\n"));
+        assert!(!fence.feed("[TOC]\n"));
+    }
+
+    #[test]
+    fn heading_with_bare_braces_keeps_them() {
+        let doc = parse("## Using {config}\n");
+        assert_eq!(summaries(&doc), vec!["Using {config}".to_string()]);
+    }
+
+    #[test]
+    fn footnotes_inside_details_are_kept_and_numbered() {
+        let doc = parse(
+            "<details>\n<summary>More</summary>\n\nBody[^n].\n\n[^n]: Note text\n</details>\n",
+        );
+        assert!(doc.footnotes.contains_key("n"));
+        let Block::Details { blocks, .. } = &doc.blocks[0] else {
+            panic!("expected details, got {:?}", doc.blocks);
+        };
+        let Block::Paragraph(inl) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            inl.iter()
+                .any(|i| matches!(i, Inline::FootnoteRef { number: 1, .. }))
+        );
+    }
+
+    #[test]
+    fn footnote_references_inside_divs_are_numbered() {
+        let doc = parse("::: note\nText[^a].\n\n[^a]: Definition.\n:::\n");
+        assert!(doc.footnotes.contains_key("a"));
+        let Block::FencedDiv { blocks, .. } = &doc.blocks[0] else {
+            panic!("expected fenced div, got {:?}", doc.blocks);
+        };
+        let Block::Paragraph(inl) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            inl.iter()
+                .any(|i| matches!(i, Inline::FootnoteRef { number: 1, .. }))
+        );
+    }
+
+    #[test]
+    fn details_with_display_math_keeps_the_rest_of_the_document() {
+        let doc =
+            parse("<details>\n<summary>Math</summary>\n\n$$\nx = 1\n$$\n\n</details>\n\n# Next\n");
+        assert!(summaries(&doc).contains(&"Next".to_string()));
+        let Block::Details { blocks, .. } = &doc.blocks[0] else {
+            panic!("expected details, got {:?}", doc.blocks);
+        };
+        assert!(blocks.iter().any(|b| matches!(b, Block::Math(_))));
+    }
+
+    #[test]
+    fn stray_end_tag_does_not_truncate_the_document() {
+        let doc = parse("- x <object>y\n- z\n\n# After\n");
+        assert!(summaries(&doc).contains(&"After".to_string()));
+    }
+
+    #[test]
+    fn html_image_wrapper_with_prose_is_not_an_image() {
+        let doc = parse("<p>Caption <img src=\"a.png\"></p>\n");
+        assert!(!matches!(doc.blocks[0], Block::Image { .. }));
+        assert!(summaries(&doc).iter().any(|t| t.contains("Caption")));
+    }
+
+    #[test]
+    fn bare_emails_end_before_a_sentence_period() {
+        assert!(links("a@b. Thanks").is_empty());
+        assert_eq!(links("(jane@example.com)"), vec!["mailto:jane@example.com"]);
+        assert_eq!(
+            links("write jane@example.com."),
+            vec!["mailto:jane@example.com"]
+        );
+    }
+
+    #[test]
+    fn html_attr_ignores_quoted_values() {
+        assert_eq!(
+            html_attr("<img alt=\"see src=x\" src=\"real.png\">", "src").as_deref(),
+            Some("real.png")
+        );
+    }
+
+    #[test]
+    fn common_named_entities_are_decoded() {
+        assert_eq!(
+            decode_html_entities("&ldquo;Hi&rdquo; &euro;5 &rsquo;&amp;"),
+            "\u{201c}Hi\u{201d} \u{20ac}5 \u{2019}&"
+        );
+    }
+
+    #[test]
+    fn html_image_dimensions_must_be_finite() {
+        let Some(Inline::Image {
+            url, width, height, ..
+        }) = parse_html_img("<img src=\" a.png \" width=\"NaN\" height=\"inf\">")
+        else {
+            panic!("expected image");
+        };
+        assert_eq!(url, "a.png");
+        assert_eq!((width, height), (None, None));
+    }
+
+    #[test]
+    fn ordered_html_list_honours_start() {
+        let doc = parse("<ol start=\"5\">\n<li>a</li>\n</ol>\n");
+        let Block::Group(blocks) = &doc.blocks[0] else {
+            panic!("expected converted HTML, got {:?}", doc.blocks);
+        };
+        assert!(matches!(
+            blocks[0],
+            Block::List {
+                ordered: true,
+                start: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn crlf_documents_parse_like_lf_documents() {
+        let doc = parse("---\r\ntitle: Doc\r\n---\r\n# Body\r\n\r\nText\r\n");
+        assert!(doc.metadata.iter().any(|(k, v)| k == "title" && v == "Doc"));
+        assert_eq!(
+            summaries(&doc),
+            vec!["Body".to_string(), "Text".to_string()]
+        );
+    }
+
+    #[test]
+    fn block_ids_are_stripped_only_at_the_end() {
+        let doc = parse("A note ^block-1\n");
+        assert_eq!(summaries(&doc), vec!["A note".to_string()]);
+    }
+
+    #[test]
+    fn abbreviations_skip_link_destinations_and_math() {
+        let doc =
+            parse("*[HTML]: HyperText\n\nSee [HTML](https://x.test/HTML), $HTML$ and HTML.\n");
+        let Block::Paragraph(inl) = &doc.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(inl.iter().any(|i| matches!(
+            i,
+            Inline::Link { url, .. } if url == "https://x.test/HTML"
+        )));
+        assert!(inl.iter().any(|i| matches!(
+            i,
+            Inline::Math { tex, .. } if tex == "HTML"
+        )));
+        assert!(inl.iter().any(|i| matches!(i, Inline::Abbr { .. })));
+    }
+
+    #[test]
+    fn error_admonition_matches_the_error_alert() {
+        let admonition = parse("!!! error\n    Body\n");
+        let alert = parse("> [!ERROR]\n> Body\n");
+        let kind = |doc: &Document| match &doc.blocks[0] {
+            Block::BlockQuote { kind, .. } => *kind,
+            other => panic!("expected callout, got {other:?}"),
+        };
+        assert_eq!(kind(&admonition), Some(AlertKind::Danger));
+        assert_eq!(kind(&admonition), kind(&alert));
     }
 }

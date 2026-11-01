@@ -4393,7 +4393,7 @@ fn append_table_inlines(
 ) {
     for inl in inlines {
         match inl {
-            Inline::Text(t) | Inline::RawHtml(t) => style.push(job, t),
+            Inline::Text(t) => style.push(job, t),
             Inline::Citation(cite) => style.push(job, &format!("[{cite}]")),
             Inline::Abbr { text, .. } => style.push(job, text),
             Inline::Tag(tag) => style.push(job, &format!("#{tag}")),
@@ -5134,7 +5134,6 @@ fn job_capable(inl: &Inline) -> bool {
         // flush it and call `Ui::end_row` instead so the next inline starts a
         // new visual line.
         Inline::Text(t) => !t.contains('\n'),
-        Inline::RawHtml(_) => true,
         Inline::Emph(v)
         | Inline::Strong(v)
         | Inline::Strike(v)
@@ -5277,13 +5276,6 @@ fn append_inline_job(job: &mut egui::text::LayoutJob, inlines: &[Inline], f: f32
                 s.color = Some(palette().accent);
                 s.valign = Some(Align::BOTTOM);
                 append_inline_job(job, v, f, s);
-            }
-            Inline::RawHtml(h) => {
-                let mut s = st;
-                s.mono = true;
-                s.scale *= 0.82;
-                s.color = Some(palette().muted);
-                job.append(h, 0.0, inline_text_format(f, s));
             }
             _ => {}
         }
@@ -5565,14 +5557,6 @@ fn render_inlines_styled(
                         .raised(),
                 )
                 .on_hover_text(format!("Footnote: {label}"));
-            }
-            Inline::RawHtml(h) => {
-                ui.label(
-                    RichText::new(h)
-                        .monospace()
-                        .size(f * 0.82)
-                        .color(palette().muted),
-                );
             }
         }
     }
