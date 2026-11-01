@@ -49,6 +49,7 @@ shasum -a 256 -c MD-Viewer-<version>-arm64.zip.sha256
 - **Print-quality PDF** — A4, running footer, clickable links, images, math and Mermaid via WeasyPrint.
 - **Native macOS UI** — dark and Paper themes, SF Pro/SF Mono, tabs, drag & drop and native dialogs.
 - **Fast & self-contained** — Metal-accelerated rendering, virtualized large documents, no browser engine.
+- AI assisted by **HAIKU 5.5**.
 
 See [feature-list.md](feature-list.md) for a concise feature overview and the
 technical characteristics.
