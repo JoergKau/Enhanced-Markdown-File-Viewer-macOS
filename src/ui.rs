@@ -5507,16 +5507,39 @@ fn render_inlines_styled(
                 render_inlines_styled(ui, v, f, s, base_dir, image_click, math_cache);
             }
             Inline::Code(c) => {
+                let size = f * 0.88 * st.scale;
+                // Code that fits the column stays on one line and moves to the
+                // next row as a whole. Only code wider than the column wraps
+                // inside its frame.
+                let column = ui.max_rect().width();
+                let text_width = ui
+                    .painter()
+                    .layout_no_wrap(c.clone(), FontId::monospace(size), palette().text)
+                    .size()
+                    .x;
+                let remaining = ui.available_rect_before_wrap().width();
+                // Not enough room left on this row: start a new one.
+                if text_width > remaining && remaining < column - 1.0 {
+                    ui.end_row();
+                }
+                let wrap = if text_width <= column {
+                    egui::TextWrapMode::Extend
+                } else {
+                    egui::TextWrapMode::Wrap
+                };
                 Frame::new()
                     .fill(palette().bg3)
                     .corner_radius(CornerRadius::same(4))
                     .inner_margin(Margin::symmetric(5, 1))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(c)
-                                .monospace()
-                                .size(f * 0.88 * st.scale)
-                                .color(palette().text),
+                        ui.add(
+                            Label::new(
+                                RichText::new(c)
+                                    .monospace()
+                                    .size(size)
+                                    .color(palette().text),
+                            )
+                            .wrap_mode(wrap),
                         );
                     });
             }
