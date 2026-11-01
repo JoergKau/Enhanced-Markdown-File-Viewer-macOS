@@ -38,7 +38,8 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
   with run-level bidi ordering for mixed-direction text.
 - Relative `.md` links, wiki-links and wiki embeds open in tabs; `![[Note]]`
   transclusion is cycle-safe.
-- Remote images are fetched with `curl` (HTTP/HTTPS only, redirects restricted)
+- Remote images are fetched with `curl` (HTTP/HTTPS only, no loopback or
+  link-local hosts, redirects restricted)
   and capped at 25 MB / 40 megapixels.
 
 ## Files
@@ -73,7 +74,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 - Rust 2024 · eframe/egui 0.37 · wgpu (Metal) · winit 0.30 ·
   pulldown-cmark 0.13 · arm64 macOS 11+.
-- 173 unit/integration tests plus an ignored deep render pass; zero build,
+- 179 unit/integration tests plus an ignored deep render pass; zero build,
   clippy and rustfmt warnings.
 - `.app` packaging with ad-hoc or Developer ID signing, optional notarization,
   and a zipped arm64 release archive with SHA-256 checksum.
