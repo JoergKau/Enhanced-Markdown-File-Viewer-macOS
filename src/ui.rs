@@ -1283,9 +1283,8 @@ impl App {
                 #[cfg(target_os = "macos")]
                 {
                     let result = crate::macos_print::print_pdf(&path);
-                    let _ = std::fs::remove_file(&path);
                     match result {
-                        Ok(()) => self.set_status("Sent to the printer.", false),
+                        Ok(()) => self.set_status("Print dialog opened.", false),
                         Err(e) if e.contains("cancelled") => {
                             self.set_status("Print cancelled.", false)
                         }
@@ -1459,8 +1458,10 @@ impl App {
                     }
                     ui.separator();
                     let mut mode = self.mode;
-                    ui.selectable_value(&mut mode, ViewMode::Preview, "Preview");
-                    ui.selectable_value(&mut mode, ViewMode::Editor, "Edit");
+                    ui.selectable_value(&mut mode, ViewMode::Preview, "Preview")
+                        .on_hover_text("Rendered preview (⌘⇧P)");
+                    ui.selectable_value(&mut mode, ViewMode::Editor, "Edit")
+                        .on_hover_text("Source editor + live preview (⌘⇧P)");
                     if mode != self.mode {
                         self.set_mode(mode);
                     }
