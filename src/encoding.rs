@@ -16,28 +16,22 @@ pub fn read_text(path: &Path) -> io::Result<String> {
 }
 
 /// Decodes file bytes into text.
-pub fn decode(bytes: &[u8]) -> io::Result<String> {
+fn decode(bytes: &[u8]) -> io::Result<String> {
     // BOM-marked encodings first.
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8(rest.to_vec())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 after BOM"));
     }
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let (text, _, had_errors) = encoding_rs::UTF_16LE.decode(rest);
+    let utf16 = [
+        (&[0xFF, 0xFE][..], encoding_rs::UTF_16LE),
+        (&[0xFE, 0xFF][..], encoding_rs::UTF_16BE),
+    ];
+    if let Some((bom, encoding)) = utf16.into_iter().find(|(bom, _)| bytes.starts_with(bom)) {
+        let (text, had_errors) = encoding.decode_without_bom_handling(&bytes[bom.len()..]);
         if had_errors {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid UTF-16LE text",
-            ));
-        }
-        return Ok(text.into_owned());
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let (text, _, had_errors) = encoding_rs::UTF_16BE.decode(rest);
-        if had_errors {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid UTF-16BE text",
+                format!("invalid {} text", encoding.name()),
             ));
         }
         return Ok(text.into_owned());
@@ -48,22 +42,18 @@ pub fn decode(bytes: &[u8]) -> io::Result<String> {
         return Ok(text.to_string());
     }
 
-    // Legacy single-byte encodings: only accept if there are no NUL bytes
-    // (a strong hint that this is not binary data) and every byte maps to a
-    // character (Windows-1252 has a few undefined slots).
+    // Legacy single-byte encodings: only accept if there are no NUL bytes,
+    // a strong hint that this is not binary data.
     if bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a UTF-8/UTF-16 text file",
         ));
     }
-    match encoding_rs::WINDOWS_1252.decode_without_bom_handling_and_without_replacement(bytes) {
-        Some(text) => Ok(text.into_owned()),
-        None => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported text encoding (expected UTF-8, UTF-16 or Windows-1252)",
-        )),
-    }
+    // WHATWG windows-1252 maps all 256 bytes (the five undefined slots become
+    // C1 controls), so this decoding cannot fail.
+    let (text, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(bytes);
+    Ok(text.into_owned())
 }
 
 #[cfg(test)]
@@ -103,6 +93,12 @@ mod tests {
     fn windows_1252_is_a_fallback() {
         // "café" in Windows-1252 (0xE9 instead of UTF-8's 0xC3 0xA9).
         assert_eq!(decode(b"caf\xE9").unwrap(), "café");
+    }
+
+    /// Windows-1252's undefined slots decode to C1 controls instead of failing.
+    #[test]
+    fn windows_1252_undefined_slots_do_not_fail() {
+        assert_eq!(decode(b"a\x81b").unwrap(), "a\u{81}b");
     }
 
     #[test]

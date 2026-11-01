@@ -34,7 +34,8 @@ use std::path::PathBuf;
 
 /// Swizzles `NSApplication.setDelegate:` and returns `true` on success.
 ///
-/// Must be called from the main thread before `eframe::run_native`.
+/// Must be called from the main thread before `eframe::run_native`. The
+/// swizzle happens once; later calls return the first result.
 pub fn install_early() -> bool {
     imp::install_early()
 }
@@ -65,7 +66,7 @@ mod imp {
     use std::ffi::CStr;
     use std::os::raw::c_char;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
     /// Files received from macOS, waiting to be opened by the UI thread.
     static PENDING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -73,8 +74,10 @@ mod imp {
     /// egui context used to wake the UI after an Apple Event arrives.
     static REPAINT: Mutex<Option<eframe::egui::Context>> = Mutex::new(None);
 
-    /// Original implementation of `NSApplication.setDelegate:`.
-    static ORIGINAL_SET_DELEGATE: Mutex<Option<Imp>> = Mutex::new(None);
+    /// Original implementation of `NSApplication.setDelegate:`, stored before
+    /// the replacement is installed. A `OnceLock` cannot be poisoned, so the
+    /// replacement always reaches winit's implementation.
+    static ORIGINAL_SET_DELEGATE: OnceLock<Imp> = OnceLock::new();
 
     pub fn set_context(ctx: eframe::egui::Context) {
         if let Ok(mut slot) = REPAINT.lock() {
@@ -82,12 +85,17 @@ mod imp {
         }
     }
 
-    /// Swizzles `NSApplication.setDelegate:`.
+    /// Swizzles `NSApplication.setDelegate:` once.
     ///
     /// Runs before `eframe::run_native`, so winit's delegate is extended the
     /// moment it is installed — before AppKit delivers any open-document
     /// Apple Event (including cold-start launches).
     pub fn install_early() -> bool {
+        static INSTALLED: OnceLock<bool> = OnceLock::new();
+        *INSTALLED.get_or_init(swizzle_set_delegate)
+    }
+
+    fn swizzle_set_delegate() -> bool {
         // SAFETY: main thread; NSApplication is a singleton. We replace one
         // method implementation and remember the original to call through.
         unsafe {
@@ -99,11 +107,10 @@ mod imp {
                 log::warn!("NSApplication.setDelegate: not found; cannot install open hooks");
                 return false;
             }
-            if let Some(original) = method_getImplementation(method)
-                && let Ok(mut slot) = ORIGINAL_SET_DELEGATE.lock()
-            {
-                *slot = Some(original);
-            }
+            let Some(original) = method_getImplementation(method) else {
+                return false;
+            };
+            let _ = ORIGINAL_SET_DELEGATE.set(original);
             let imp: Imp = std::mem::transmute(set_delegate as *const ());
             method_setImplementation(method, imp);
             log::info!("installed macOS setDelegate swizzle");
@@ -118,10 +125,9 @@ mod imp {
         delegate: *mut AnyObject,
     ) {
         // Call the original implementation first (winit stores its delegate).
-        let original = ORIGINAL_SET_DELEGATE.lock().ok().and_then(|slot| *slot);
-        if let Some(original) = original {
+        if let Some(original) = ORIGINAL_SET_DELEGATE.get() {
             type SetDelegateFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject);
-            let f: SetDelegateFn = unsafe { std::mem::transmute(original) };
+            let f: SetDelegateFn = unsafe { std::mem::transmute(*original) };
             // SAFETY: matches the Objective-C signature of `setDelegate:`.
             unsafe { f(this, cmd, delegate) };
         }

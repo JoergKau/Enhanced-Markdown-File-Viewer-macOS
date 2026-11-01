@@ -131,7 +131,7 @@ mod imp {
                 .find(super::PROJECT_PAGE)
                 .map(|byte| text_value[..byte].encode_utf16().count())
                 .unwrap_or(0);
-            let range = NSRange::new(link_start, super::PROJECT_PAGE.len());
+            let range = NSRange::new(link_start, super::PROJECT_PAGE.encode_utf16().count());
             // SAFETY: `NSLink` expects an NSURL value; the range is the exact
             // UTF-16 span of the URL inside the credits string.
             unsafe {

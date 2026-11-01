@@ -41,7 +41,7 @@ for arg in "$@"; do
     --install) INSTALL=1 ;;
     --package) PACKAGE=1 ;;
     --help|-h)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      awk 'NR > 2 && !/^#/ { exit } NR > 2 { sub(/^# ?/, ""); print }' "$0"
       exit 0
       ;;
     *)
@@ -173,7 +173,8 @@ LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchService
 
 package_app() {
   mkdir -p dist
-  local zip="dist/${APP_NAME}-${VERSION}-arm64.zip"
+  local name="${APP_NAME}-${VERSION}-arm64.zip"
+  local zip="dist/$name"
   rm -f "$zip" "$zip.sha256"
 
   if [ -n "${NOTARY_PROFILE:-}" ]; then
@@ -182,18 +183,23 @@ package_app() {
       echo "       Set CODESIGN_IDENTITY to a Developer ID Application certificate." >&2
       exit 1
     fi
+    # notarytool needs an archive to submit; it is discarded, because the
+    # stapled bundle must be archived again for the ticket to ship.
+    local submit_dir
+    submit_dir="$(mktemp -d)"
     echo "==> Notarizing (profile: $NOTARY_PROFILE)…"
-    ditto -c -k --keepParent --norsrc --noextattr "$APP_DIR" "$zip"
-    xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --wait
+    ditto -c -k --keepParent --norsrc --noextattr "$APP_DIR" "$submit_dir/$name"
+    xcrun notarytool submit "$submit_dir/$name" --keychain-profile "$NOTARY_PROFILE" --wait
+    rm -rf "$submit_dir"
     echo "==> Stapling notarization ticket…"
     xcrun stapler staple "$APP_DIR"
     xcrun stapler validate "$APP_DIR"
-    rm -f "$zip"
   fi
 
   echo "==> Creating release archive…"
   ditto -c -k --keepParent --norsrc --noextattr "$APP_DIR" "$zip"
-  shasum -a 256 "$zip" > "$zip.sha256"
+  # Checksum from inside dist/, so `shasum -c` works on the file as shipped.
+  (cd dist && shasum -a 256 "$name" > "$name.sha256")
 
   echo
   echo "Package: $zip"
