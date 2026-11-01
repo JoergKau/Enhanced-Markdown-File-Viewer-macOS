@@ -6,16 +6,17 @@
 //! The app opens in the **rendered Markdown view** (no split screen). Every
 //! document has a tab in the strip below the toolbar. The toolbar can switch to
 //! **Edit**, which shows a split screen: raw Markdown on the left and the live
-//! rendered preview on the right.
+//! rendered preview on the right. The split is laid out by hand inside the
+//! central panel (see `App::edit_split`), not with an egui side panel.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────┐
 //! │ toolbar (top panel)                                  │
 //! ├──────────────────────────────────────────────────────┤
-//! │ tab strip (top panel)                                │
+//! │ tab strip (top panel, two or more tabs)              │
 //! ├───────────────────────────┬──────────────────────────┤
-//! │ editor (central panel)    │ live preview (side       │
-//! │                           │ panel, resizable)        │
+//! │ editor (left, Edit mode)  │ live preview (right,     │
+//! │                           │ Edit mode)               │
 //! ├───────────────────────────┴──────────────────────────┤
 //! │ status bar (bottom panel)                            │
 //! └──────────────────────────────────────────────────────┘
@@ -56,10 +57,13 @@ use eframe::egui::{
     self, Align, Checkbox, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, Modifiers,
     Rect, RichText, ScrollArea, Stroke, TextFormat, TextStyle, Ui, Vec2,
 };
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use std::{io, path::Path, path::PathBuf};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::load::{
     Bytes, BytesLoadResult, BytesLoader, BytesPoll, ImageLoadResult, ImageLoader, ImagePoll,
@@ -199,20 +203,15 @@ mod theme {
         }
     }
 
-    pub fn set_mode(mode: Mode) {
-        MODE.store(
-            match mode {
-                Mode::Dark => 0,
-                Mode::Paper => 1,
-            },
-            Ordering::Relaxed,
-        );
+    #[cfg(test)]
+    pub(super) fn set_mode(mode: Mode) {
+        MODE.store(mode as u8, Ordering::Relaxed);
     }
 
     /// Switches to the other theme and returns the new mode.
     pub fn toggle() -> Mode {
         let next = mode().toggled();
-        set_mode(next);
+        MODE.store(next as u8, Ordering::Relaxed);
         next
     }
 
@@ -265,6 +264,13 @@ const MIN_FONT_SIZE: f32 = 9.0;
 const MAX_FONT_SIZE: f32 = 36.0;
 /// Width/height shared by the `A−`, magnification readout and `A+` controls.
 const ZOOM_CONTROL_SIZE: Vec2 = Vec2::new(52.0, 24.0);
+/// How long a status message stays visible in the status bar.
+const STATUS_DURATION: Duration = Duration::from_secs(4);
+/// File extensions treated as Markdown by dialogs, drops and wiki links.
+const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "txt"];
+/// Zoom limits of the picture viewer (the same range as [`egui::Scene`]).
+const IMAGE_ZOOM_MIN: f32 = 0.05;
+const IMAGE_ZOOM_MAX: f32 = 8.0;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -314,14 +320,24 @@ fn startup_candidates() -> Vec<PathBuf> {
 
 /// How the document is displayed.
 ///
-/// The app opens in the rendered Markdown view by default; the source editor
-/// is a secondary mode (no split view).
+/// The app opens in the rendered Markdown view by default; Edit mode shows the
+/// source editor next to the live preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ViewMode {
+enum ViewMode {
     /// Rendered Markdown (default).
     Preview,
-    /// Raw Markdown source editor.
+    /// Raw Markdown source editor next to the live preview.
     Editor,
+}
+
+impl ViewMode {
+    /// The other view mode (⌘⇧P).
+    fn toggled(self) -> Self {
+        match self {
+            ViewMode::Preview => ViewMode::Editor,
+            ViewMode::Editor => ViewMode::Preview,
+        }
+    }
 }
 
 /// Button chosen in the unsaved-changes sheet.
@@ -353,9 +369,7 @@ struct ImageRequest {
 /// its real size) is available, not while the loader still reports a
 /// placeholder size.
 struct ImageViewer {
-    alt: String,
-    url: String,
-    uri: String,
+    request: ImageRequest,
     /// Visible rectangle in image (scene) coordinates; `Rect::ZERO` = refit.
     scene_rect: Rect,
     /// Whether the initial fit-to-window has been applied.
@@ -365,9 +379,7 @@ struct ImageViewer {
 impl ImageViewer {
     fn new(request: ImageRequest) -> Self {
         Self {
-            alt: request.alt,
-            url: request.url,
-            uri: request.uri,
+            request,
             scene_rect: Rect::ZERO,
             fitted: false,
         }
@@ -375,10 +387,11 @@ impl ImageViewer {
 
     /// Human-readable title: alt text, or the file name from the URL.
     fn title(&self) -> String {
-        if !self.alt.trim().is_empty() {
-            return self.alt.clone();
+        if !self.request.alt.trim().is_empty() {
+            return self.request.alt.clone();
         }
-        self.url
+        self.request
+            .url
             .rsplit('/')
             .next()
             .filter(|name| !name.is_empty())
@@ -396,7 +409,7 @@ impl ImageViewer {
             return;
         }
         let current = viewport.x / self.scene_rect.width();
-        let target = (current * factor).clamp(0.05, 8.0);
+        let target = (current * factor).clamp(IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX);
         let size = self.scene_rect.size() * (current / target);
         self.scene_rect = Rect::from_center_size(self.scene_rect.center(), size);
     }
@@ -431,14 +444,22 @@ struct MathTexture {
 /// Lazy LaTeX renderer and texture cache.
 ///
 /// Uses `latex-rust` (pure Rust, embedded STIX Two Math font) with its PNG
-/// backend. The raster is converted to an egui texture once per formula/size.
+/// backend. The raster is converted to an egui texture once per formula/size;
+/// the cache is cleared once it holds [`MATH_CACHE_LIMIT`] entries.
 /// If a formula contains an unsupported construct, the entry stores `None` and
 /// the preview falls back to the LaTeX source.
 #[derive(Default)]
 struct MathCache {
     entries: HashMap<MathKey, Option<MathTexture>>,
-    font: Option<latex_rust::MathFont>,
+    /// `None` until the first formula is rendered; `Some(None)` if the font
+    /// failed to load, so the failure is not retried for every formula.
+    font: Option<Option<latex_rust::MathFont>>,
 }
+
+/// Upper bound for cached formula textures. Inline and display formulas use
+/// different sizes at the same time, so entries are dropped in bulk instead of
+/// on every size change.
+const MATH_CACHE_LIMIT: usize = 512;
 
 impl MathCache {
     /// Returns a texture for `tex`, rendering it on first use.
@@ -456,6 +477,9 @@ impl MathCache {
             theme: theme::mode() as u8,
         };
         if !self.entries.contains_key(&key) {
+            if self.entries.len() >= MATH_CACHE_LIMIT {
+                self.entries.clear();
+            }
             let rendered = self.render(ctx, &key);
             self.entries.insert(key.clone(), rendered);
         }
@@ -464,10 +488,10 @@ impl MathCache {
 
     /// Parses/lays out/rasterizes one formula and uploads it as a texture.
     fn render(&mut self, ctx: &egui::Context, key: &MathKey) -> Option<MathTexture> {
-        if self.font.is_none() {
-            self.font = latex_rust::MathFont::stix_two_math().ok();
-        }
-        let font = self.font.as_ref()?;
+        let font = self
+            .font
+            .get_or_insert_with(|| latex_rust::MathFont::stix_two_math().ok())
+            .as_ref()?;
 
         let ppp = ctx.pixels_per_point();
         let mut options = latex_rust::PngOptions::new();
@@ -529,7 +553,7 @@ fn render_math(ui: &mut Ui, tex: &str, size: f32, display: bool, cache: &mut Mat
 /// every frame); inactive tabs are stored here and swapped in by
 /// [`App::switch_tab`]. This keeps the hot rendering path unchanged while
 /// still supporting multiple documents.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TabState {
     text: String,
     doc: parser::Document,
@@ -538,27 +562,35 @@ struct TabState {
     line_count: usize,
     word_count: usize,
     last_cursor: (usize, usize),
-    jump_line: Option<usize>,
     preview_line: Option<usize>,
     preview_top_line: usize,
 }
 
 impl TabState {
-    fn blank() -> Self {
-        let text = String::new();
+    /// A tab for `text` that is not dirty and starts at the top of the preview.
+    fn from_text(text: String, path: Option<PathBuf>) -> Self {
+        let (line_count, word_count) = text_stats(&text);
         Self {
             doc: parser::parse(&text),
             text,
-            path: None,
+            path,
             dirty: false,
-            line_count: 0,
-            word_count: 0,
+            line_count,
+            word_count,
             last_cursor: (1, 1),
-            jump_line: None,
             preview_line: None,
             preview_top_line: 1,
         }
     }
+
+    fn blank() -> Self {
+        Self::from_text(String::new(), None)
+    }
+}
+
+/// Line and word counts shown in the status bar.
+fn text_stats(text: &str) -> (usize, usize) {
+    (text.lines().count(), text.split_whitespace().count())
 }
 
 /// Label shown on a tab: the file name, or "Untitled".
@@ -591,10 +623,27 @@ fn fenced_div_label(class: &str) -> String {
         .to_string()
 }
 
+/// Accent color of a fenced div, chosen by the whole words in its label
+/// (`multiple` is not `tip`).
+fn fenced_div_color(label: &str) -> Color32 {
+    let lower = label.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    let has = |names: &[&str]| words.iter().any(|word| names.contains(word));
+    if has(&["warning", "caution", "danger"]) {
+        palette().red
+    } else if has(&["tip", "success"]) {
+        palette().green
+    } else if has(&["important"]) {
+        palette().purple
+    } else {
+        palette().accent
+    }
+}
+
 /// Cached embedded documents (`![[Note]]` transclusion).
 #[derive(Clone, Default)]
 struct TransclusionCache {
-    entries: HashMap<PathBuf, (Option<std::time::SystemTime>, parser::Document)>,
+    entries: HashMap<PathBuf, (Option<std::time::SystemTime>, Arc<parser::Document>)>,
 }
 
 /// Context key for the current transclusion nesting depth.
@@ -635,22 +684,29 @@ fn render_transclusion(
     }
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let cache_id = egui::Id::unique("mdviewer_transclusion_cache");
-    let doc = ui.data_mut(|data| {
+    let cached = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<TransclusionCache>(cache_id);
-        if let Some((cached_modified, doc)) = cache.entries.get(path)
-            && *cached_modified == modified
-        {
-            return doc.clone();
-        }
-        let Ok(text) = crate::encoding::read_text(path) else {
-            return parser::Document::default();
-        };
-        let doc = parser::parse(&text);
         cache
             .entries
-            .insert(path.to_path_buf(), (modified, doc.clone()));
-        doc
+            .get(path)
+            .filter(|(cached_modified, _)| *cached_modified == modified)
+            .map(|(_, doc)| Arc::clone(doc))
     });
+    let doc = match cached {
+        Some(doc) => doc,
+        None => {
+            let Ok(text) = crate::encoding::read_text(path) else {
+                return;
+            };
+            let doc = Arc::new(parser::parse(&text));
+            ui.data_mut(|data| {
+                data.get_temp_mut_or_default::<TransclusionCache>(cache_id)
+                    .entries
+                    .insert(path.to_path_buf(), (modified, Arc::clone(&doc)));
+            });
+            doc
+        }
+    };
     if doc.blocks.is_empty() {
         return;
     }
@@ -678,17 +734,13 @@ fn render_transclusion(
                     .color(palette().faint),
             );
             ui.add_space(4.0);
-            let base = path.parent();
             render_blocks(
                 ui,
                 &doc.blocks,
                 f * 0.95,
-                1,
-                base,
+                path.parent(),
                 image_click,
                 math_cache,
-                &[],
-                &mut Vec::new(),
             );
         });
     ui.data_mut(|data| data.insert_temp(transclusion_depth_id(), depth));
@@ -735,16 +787,16 @@ const PREVIEW_OVERSCAN: f32 = 800.0;
 /// view preferences. It is created once per window in [`App::new`].
 pub struct App {
     /// Editor buffer (single source of truth for the active tab).
-    pub text: String,
+    text: String,
     /// Parsed model for the preview (the PDF export renders `text` directly).
-    pub doc: parser::Document,
+    doc: parser::Document,
     /// Currently open file.
-    pub path: Option<PathBuf>,
+    path: Option<PathBuf>,
     /// Folder of the startup document, used to resolve its relative images
     /// and links. `None` when no startup document was found.
     startup_base: Option<PathBuf>,
     /// Unsaved changes.
-    pub dirty: bool,
+    dirty: bool,
     /// All open tabs. The active slot is a snapshot from the last switch; its
     /// live state is in the fields above.
     tabs: Vec<TabState>,
@@ -753,9 +805,12 @@ pub struct App {
     /// Tab whose close button was pressed and that has unsaved changes.
     pending_tab_close: Option<usize>,
     /// Current view mode (rendered preview by default).
-    pub mode: ViewMode,
+    mode: ViewMode,
     /// Whether the outline sidebar is visible.
     outline_open: bool,
+    /// Headings for the outline sidebar, rebuilt when the preview revision changes.
+    outline: Arc<Vec<(u8, usize, String)>>,
+    outline_revision: u64,
     /// Find/replace bar state.
     find_open: bool,
     find_query: String,
@@ -765,16 +820,18 @@ pub struct App {
     find_cache: (String, u64),
     find_focus: bool,
     /// Split position in Edit mode (`0.5` = 50/50). Persists while dragging.
-    pub split_fraction: f32,
+    split_fraction: f32,
     /// Font size (editor & preview; ⌘+/⌘− zoom).
-    pub font_size: f32,
+    font_size: f32,
     /// Status toast: (text, is_error, timestamp).
-    pub status: Option<(String, bool, Instant)>,
+    status: Option<(String, bool, Instant)>,
     /// Cached statistics.
     line_count: usize,
     word_count: usize,
     /// Last cursor position (line, column).
     last_cursor: (usize, usize),
+    /// Character index and preview revision `last_cursor` was computed for.
+    cursor_key: Option<(usize, u64)>,
     /// Cached window title to avoid sending a viewport command every frame.
     last_title: String,
     /// Open modal picture viewer, if any.
@@ -785,8 +842,9 @@ pub struct App {
     preview_revision: u64,
     /// Cached heights for the virtualized preview.
     preview_metrics: PreviewMetrics,
-    /// Pending "jump to source line" request from a click in the preview.
-    /// Consumed by the split editor on the next frame.
+    /// Pending caret move for the source editor (Edit mode only), set by
+    /// preview clicks, outline clicks and find reveals. Consumed by
+    /// [`editor_ui`] on the next frame.
     jump_line: Option<usize>,
     /// Pending preview scroll target (source line) when switching from the
     /// editor back to the rendered preview.
@@ -831,8 +889,7 @@ impl App {
 
         let (text, startup_base) = startup_document();
         let doc = parser::parse(&text);
-        let line_count = text.lines().count();
-        let word_count = text.split_whitespace().count();
+        let (line_count, word_count) = text_stats(&text);
         let weasyprint_ready = crate::export::weasyprint_path().is_some();
         let mut app = Self {
             text,
@@ -845,6 +902,8 @@ impl App {
             pending_tab_close: None,
             mode: ViewMode::Preview,
             outline_open: false,
+            outline: Arc::new(Vec::new()),
+            outline_revision: 0,
             find_open: false,
             find_query: String::new(),
             replace_text: String::new(),
@@ -858,6 +917,7 @@ impl App {
             line_count,
             word_count,
             last_cursor: (1, 1),
+            cursor_key: None,
             last_title: String::new(),
             image_viewer: None,
             math_cache: MathCache::default(),
@@ -900,7 +960,6 @@ impl App {
             line_count: self.line_count,
             word_count: self.word_count,
             last_cursor: self.last_cursor,
-            jump_line: self.jump_line,
             preview_line: self.preview_line,
             preview_top_line: self.preview_top_line,
         }
@@ -926,7 +985,9 @@ impl App {
         self.line_count = tab.line_count;
         self.word_count = tab.word_count;
         self.last_cursor = tab.last_cursor;
-        self.jump_line = tab.jump_line;
+        self.cursor_key = None;
+        // A caret move is only meant for the tab that requested it.
+        self.jump_line = None;
         // Restore the reading position: remember where the tab was left and
         // scroll the preview there on the next frame.
         self.preview_line = tab
@@ -943,7 +1004,7 @@ impl App {
             return;
         }
         self.store_active();
-        let tab = self.tabs[index].clone();
+        let tab = std::mem::take(&mut self.tabs[index]);
         self.load_tab(tab);
         self.active_tab = index;
     }
@@ -995,16 +1056,16 @@ impl App {
         }
         if index == self.active_tab {
             self.tabs.remove(index);
+            // The active slot is overwritten by the next `store_active`.
             if self.tabs.is_empty() {
-                let tab = TabState::blank();
-                self.tabs.push(tab.clone());
+                self.tabs.push(TabState::default());
                 self.active_tab = 0;
-                self.load_tab(tab);
+                self.load_tab(TabState::blank());
                 return;
             }
             let next = index.min(self.tabs.len() - 1);
-            let tab = self.tabs[next].clone();
             self.active_tab = next;
+            let tab = std::mem::take(&mut self.tabs[next]);
             self.load_tab(tab);
         } else {
             self.tabs.remove(index);
@@ -1026,21 +1087,15 @@ impl App {
         }
     }
 
-    /// Saves every dirty tab. Returns `false` if the user cancels a Save As
-    /// dialog or a write fails.
+    /// Saves every dirty tab, switching to each one in turn. Returns `false` if
+    /// a Save As dialog is cancelled, the target is open in another tab, or a
+    /// write fails.
     fn save_all_tabs(&mut self) -> bool {
         for index in 0..self.tabs.len() {
             self.switch_tab(index);
-            if self.dirty {
-                if let Err(e) = self.do_save() {
-                    self.set_status(format!("Save failed: {e}"), true);
-                    return false;
-                }
-                if self.dirty {
-                    return false; // Save As was cancelled
-                }
+            if self.dirty && !self.do_save() {
+                return false;
             }
-            self.store_active();
         }
         true
     }
@@ -1056,6 +1111,7 @@ impl App {
                 self.jump_line = None;
                 self.preview_line = None;
                 self.preview_top_line = 1;
+                self.last_cursor = (1, 1);
                 self.reparse();
                 self.store_active();
                 self.set_status(format!("Opened: {}", path.display()), false);
@@ -1065,6 +1121,29 @@ impl App {
     }
 
     // ---------------- Actions ----------------
+
+    /// Keeps the window open while any document has unsaved changes. The
+    /// save-changes sheet opens only when no tab sheet is pending.
+    fn guard_window_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty_count() > 0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.pending_tab_close.is_none() {
+                self.close_dialog = true;
+            }
+        }
+    }
+
+    /// Opens a local file that was clicked in a document. Markdown opens in a
+    /// tab; other files go to the system's default application.
+    fn open_linked_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if !path.is_file() {
+            self.set_status(format!("File not found: {}", path.display()), true);
+        } else if is_markdown(&path) {
+            self.open_path(path);
+        } else {
+            ctx.open_url(egui::OpenUrl::new_tab(file_url(&path)));
+        }
+    }
 
     /// Switches the view mode.
     ///
@@ -1093,15 +1172,16 @@ impl App {
 
     /// Re-parses the editor text and refreshes the cached statistics.
     ///
-    /// Called after every editor change, file open and drag & drop.
+    /// Called after every editor change and when a file is opened in the
+    /// current tab. Opening into a new tab parses the file in
+    /// [`App::open_path`] instead.
     fn reparse(&mut self) {
         self.doc = parser::parse(&self.text);
         self.preview_revision = self.preview_revision.wrapping_add(1);
-        self.line_count = self.text.lines().count();
-        self.word_count = self.text.split_whitespace().count();
+        (self.line_count, self.word_count) = text_stats(&self.text);
     }
 
-    /// Shows a transient status message (auto-hides after ~4 seconds).
+    /// Shows a transient status message; it hides after [`STATUS_DURATION`].
     fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
         self.status = Some((msg.into(), is_error, Instant::now()));
     }
@@ -1131,7 +1211,7 @@ impl App {
     fn open_dialog(&mut self) {
         let Some(p) = rfd::FileDialog::new()
             .set_title("Open Markdown")
-            .add_filter("Markdown", &["md", "markdown", "mdown", "txt"])
+            .add_filter("Markdown", MARKDOWN_EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -1139,13 +1219,15 @@ impl App {
         self.open_path(p);
     }
 
-    /// A pristine, empty "Untitled" tab (no path, no edits, no text).
+    /// A pristine, empty "Untitled" tab (no path, no edits, and only
+    /// whitespace or nothing in the buffer).
     fn is_blank_untitled(&self) -> bool {
         self.path.is_none() && !self.dirty && self.text.trim().is_empty()
     }
 
     /// Loads a file into a new tab (used by dialog, drag & drop and macOS
-    /// open events). If the file is already open, its tab is activated.
+    /// open events). If the file is already open, its tab is activated. A
+    /// pristine Untitled tab is reused instead of creating a new one.
     fn open_path(&mut self, path: PathBuf) {
         if let Some(index) = self.find_tab(&path) {
             if index != self.active_tab {
@@ -1163,13 +1245,9 @@ impl App {
         match crate::encoding::read_text(&path) {
             Ok(text) => {
                 self.store_active();
-                let mut tab = TabState::blank();
-                tab.text = text;
-                tab.doc = parser::parse(&tab.text);
-                tab.line_count = tab.text.lines().count();
-                tab.word_count = tab.text.split_whitespace().count();
-                tab.path = Some(path.clone());
-                self.tabs.push(tab.clone());
+                let tab = TabState::from_text(text, Some(path.clone()));
+                // The placeholder is overwritten when the tab is stored again.
+                self.tabs.push(TabState::default());
                 self.active_tab = self.tabs.len() - 1;
                 self.load_tab(tab);
                 self.set_status(format!("Opened: {}", path.display()), false);
@@ -1180,51 +1258,70 @@ impl App {
 
     /// Saves to the current path (or asks for one if the file is new).
     fn save(&mut self) {
-        if let Err(e) = self.do_save() {
-            self.set_status(format!("Save failed: {e}"), true);
+        self.do_save();
+    }
+
+    /// Saves to the current path, or through "Save as…" for a new document.
+    /// Returns `false` if nothing was written; errors go to the status bar.
+    fn do_save(&mut self) -> bool {
+        match self.path.clone() {
+            Some(path) => self.write_document(&path),
+            None => self.save_as_dialog(),
         }
     }
 
-    /// Writes the buffer to disk; falls back to "Save as…" for new documents.
-    fn do_save(&mut self) -> io::Result<()> {
-        let path = match self.path.clone() {
-            Some(p) => p,
-            None => {
-                self.save_as_dialog();
-                return Ok(());
+    /// Writes the buffer to `path` and makes it the document's path.
+    fn write_document(&mut self, path: &Path) -> bool {
+        match std::fs::write(path, self.text.as_bytes()) {
+            Ok(()) => {
+                self.set_status(format!("Saved: {}", path.display()), false);
+                self.path = Some(path.to_path_buf());
+                self.dirty = false;
+                true
             }
-        };
-        std::fs::write(&path, self.text.as_bytes())?;
-        self.set_status(format!("Saved: {}", path.display()), false);
-        self.path = Some(path);
-        self.dirty = false;
-        Ok(())
+            Err(e) => {
+                self.set_status(format!("Save failed: {e}"), true);
+                false
+            }
+        }
+    }
+
+    /// Default file name for a save or export dialog, based on the title.
+    fn default_file_name(&self, ext: &str) -> String {
+        let stem = self
+            .doc
+            .title
+            .as_deref()
+            .map(slug)
+            .filter(|stem| !stem.is_empty());
+        format!("{}.{ext}", stem.as_deref().unwrap_or("document"))
     }
 
     /// "Save as…" dialog with a file name derived from the document title.
-    fn save_as_dialog(&mut self) {
-        let default_name = self
-            .doc
-            .title
-            .clone()
-            .map(|t| format!("{}.md", slug(&t)))
-            .unwrap_or_else(|| "document.md".into());
+    ///
+    /// If the chosen file is already open in another tab, that tab is
+    /// activated and nothing is written, so the file cannot be open twice.
+    fn save_as_dialog(&mut self) -> bool {
+        let default_name = self.default_file_name("md");
         let Some(p) = rfd::FileDialog::new()
             .set_title("Save Markdown as…")
-            .add_filter("Markdown", &["md", "markdown"])
+            .add_filter("Markdown", MARKDOWN_EXTENSIONS)
             .set_file_name(&default_name)
             .save_file()
         else {
-            return;
+            return false;
         };
-        match std::fs::write(&p, self.text.as_bytes()) {
-            Ok(()) => {
-                self.set_status(format!("Saved: {}", p.display()), false);
-                self.path = Some(p);
-                self.dirty = false;
-            }
-            Err(e) => self.set_status(format!("Save failed: {e}"), true),
+        if let Some(index) = self.find_tab(&p)
+            && index != self.active_tab
+        {
+            self.switch_tab(index);
+            self.set_status(
+                format!("{} is already open in another tab.", p.display()),
+                true,
+            );
+            return false;
         }
+        self.write_document(&p)
     }
 
     /// Exports the current document as PDF via a native save dialog.
@@ -1232,19 +1329,10 @@ impl App {
     /// WeasyPrint is mandatory: failures are reported in the status bar and
     /// nothing is written.
     fn export_pdf(&mut self) {
-        // Re-check so a WeasyPrint installed while the app is running is
-        // picked up without a restart.
-        self.refresh_weasyprint();
-        if !self.weasyprint_ready {
-            self.weasyprint_dialog = true;
+        if !self.require_weasyprint() {
             return;
         }
-        let default_name = self
-            .doc
-            .title
-            .clone()
-            .map(|t| format!("{}.pdf", slug(&t)))
-            .unwrap_or_else(|| "document.pdf".into());
+        let default_name = self.default_file_name("pdf");
         let Some(p) = rfd::FileDialog::new()
             .set_title("Export as PDF…")
             .add_filter("PDF", &["pdf"])
@@ -1262,12 +1350,15 @@ impl App {
 
     /// Prints the current document: exports a temporary PDF and shows the
     /// native macOS print dialog (PDFKit).
+    ///
+    /// Stale `md-viewer-print-*.pdf` files older than an hour are removed from
+    /// the temp directory first. The print sheet is non-blocking, so the file
+    /// the current print uses cannot be deleted right away.
     fn print_document(&mut self) {
-        self.refresh_weasyprint();
-        if !self.weasyprint_ready {
-            self.weasyprint_dialog = true;
+        if !self.require_weasyprint() {
             return;
         }
+        remove_stale_print_files(&std::env::temp_dir(), Duration::from_secs(60 * 60));
         let base_dir = self.base_dir();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1301,72 +1392,88 @@ impl App {
         self.weasyprint_ready = crate::export::weasyprint_path().is_some();
     }
 
-    /// Typical macOS shortcuts: ⌘O open, ⌘S/⌘⇧S save, ⌘E PDF,
-    /// ⌘P print, ⌘⇧P toggle preview, ⌘+/−/0 zoom.
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::Escape) && self.find_open {
-                self.find_open = false;
-            }
-            if !i.modifiers.contains(Modifiers::COMMAND) {
-                return;
-            }
-            if i.key_pressed(egui::Key::F) {
-                self.find_open = true;
-                self.find_focus = true;
-                self.find_cache = (String::new(), 0);
-            }
-            if i.key_pressed(egui::Key::G) {
-                if i.modifiers.shift {
-                    self.find_prev();
-                } else {
-                    self.find_next();
-                }
-            }
-            if i.key_pressed(egui::Key::O) {
-                if i.modifiers.shift {
-                    self.outline_open = !self.outline_open;
-                } else {
-                    self.open_dialog();
-                }
-            }
-            if i.key_pressed(egui::Key::S) {
-                if i.modifiers.contains(Modifiers::SHIFT) {
-                    self.save_as_dialog();
-                } else {
-                    self.save();
-                }
-            }
-            if i.key_pressed(egui::Key::E) {
-                self.export_pdf();
-            }
-            if i.key_pressed(egui::Key::W) {
-                self.request_close_tab(self.active_tab);
-            }
-            if i.key_pressed(egui::Key::P) {
-                if i.modifiers.shift {
-                    let next = match self.mode {
-                        ViewMode::Preview => ViewMode::Editor,
-                        ViewMode::Editor => ViewMode::Preview,
-                    };
-                    self.set_mode(next);
-                } else {
-                    self.print_document();
-                }
-            }
-            if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
-                self.font_size = (self.font_size + 1.0).min(MAX_FONT_SIZE);
-            }
-            if i.key_pressed(egui::Key::Minus) {
-                self.font_size = (self.font_size - 1.0).max(MIN_FONT_SIZE);
-            }
-            if i.key_pressed(egui::Key::Num0) {
-                self.font_size = DEFAULT_FONT_SIZE;
-            }
-        });
+    /// Re-checks WeasyPrint for an export. When it is missing, opens the setup
+    /// dialog and returns `false`.
+    fn require_weasyprint(&mut self) -> bool {
+        self.refresh_weasyprint();
+        if !self.weasyprint_ready {
+            self.weasyprint_dialog = true;
+        }
+        self.weasyprint_ready
     }
 
-    /// Opens every `.md` file dropped onto the window (one tab per file).
+    /// Shows the find bar and focuses its query field.
+    fn open_find_bar(&mut self) {
+        self.find_open = true;
+        self.find_focus = true;
+    }
+
+    /// Changes the font size by `delta` points, clamped to the supported range.
+    fn set_font_size(&mut self, delta: f32) {
+        self.font_size = (self.font_size + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+    }
+
+    /// Keyboard shortcuts, active only when no modal owns the input.
+    ///
+    /// ⌘O open · ⌘S save · ⌘⇧S save as · ⌘E export PDF · ⌘W close tab ·
+    /// ⌘P print · ⌘⇧P toggle Preview/Edit · ⌘⇧O outline · ⌘F find ·
+    /// ⌘G next match · ⌘⇧G previous match · ⌘+ / ⌘= larger · ⌘− smaller ·
+    /// ⌘0 reset zoom · Esc closes the find bar.
+    ///
+    /// The key is read inside `ctx.input`, but the action runs after the
+    /// closure returns: dialogs and the print sheet must not run while egui's
+    /// input lock is held.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (escape, key, shift) = ctx.input(|i| {
+            let key = if i.modifiers.contains(Modifiers::COMMAND) {
+                [
+                    egui::Key::F,
+                    egui::Key::G,
+                    egui::Key::O,
+                    egui::Key::S,
+                    egui::Key::E,
+                    egui::Key::W,
+                    egui::Key::P,
+                    egui::Key::Equals,
+                    egui::Key::Plus,
+                    egui::Key::Minus,
+                    egui::Key::Num0,
+                ]
+                .into_iter()
+                .find(|key| i.key_pressed(*key))
+            } else {
+                None
+            };
+            (i.key_pressed(egui::Key::Escape), key, i.modifiers.shift)
+        });
+        if escape {
+            self.find_open = false;
+        }
+        let Some(key) = key else {
+            return;
+        };
+        match key {
+            egui::Key::F => self.open_find_bar(),
+            egui::Key::G if shift => self.find_prev(),
+            egui::Key::G => self.find_next(),
+            egui::Key::O if shift => self.outline_open = !self.outline_open,
+            egui::Key::O => self.open_dialog(),
+            egui::Key::S if shift => {
+                self.save_as_dialog();
+            }
+            egui::Key::S => self.save(),
+            egui::Key::E => self.export_pdf(),
+            egui::Key::W => self.request_close_tab(self.active_tab),
+            egui::Key::P if shift => self.set_mode(self.mode.toggled()),
+            egui::Key::P => self.print_document(),
+            egui::Key::Equals | egui::Key::Plus => self.set_font_size(1.0),
+            egui::Key::Minus => self.set_font_size(-1.0),
+            egui::Key::Num0 => self.font_size = DEFAULT_FONT_SIZE,
+            _ => {}
+        }
+    }
+
+    /// Opens every Markdown file dropped onto the window (one tab per file).
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let files = ctx.input(|i| i.raw.dropped_files.clone());
         for file in files {
@@ -1427,11 +1534,7 @@ impl App {
                         )
                     };
                     if export.clicked() {
-                        if self.weasyprint_ready {
-                            self.export_pdf();
-                        } else {
-                            self.weasyprint_dialog = true;
-                        }
+                        self.export_pdf();
                     }
 
                     // Print uses the same mandatory WeasyPrint path, then hands
@@ -1450,11 +1553,7 @@ impl App {
                         )
                     };
                     if print.clicked() {
-                        if self.weasyprint_ready {
-                            self.print_document();
-                        } else {
-                            self.weasyprint_dialog = true;
-                        }
+                        self.print_document();
                     }
                     ui.separator();
                     let mut mode = self.mode;
@@ -1473,9 +1572,7 @@ impl App {
                         .on_hover_text("Find & replace (⌘F)")
                         .clicked()
                     {
-                        self.find_open = true;
-                        self.find_focus = true;
-                        self.find_cache = (String::new(), 0);
+                        self.open_find_bar();
                     }
                     ui.separator();
                     if ui
@@ -1483,7 +1580,7 @@ impl App {
                         .on_hover_text("Smaller font (⌘−)")
                         .clicked()
                     {
-                        self.font_size = (self.font_size - 1.0).max(MIN_FONT_SIZE);
+                        self.set_font_size(-1.0);
                     }
                     // Magnification readout. It is intentionally a button: a
                     // click restores 100% (the same action as ⌘0).
@@ -1508,7 +1605,7 @@ impl App {
                         .on_hover_text("Larger font (⌘+)")
                         .clicked()
                     {
-                        self.font_size = (self.font_size + 1.0).min(MAX_FONT_SIZE);
+                        self.set_font_size(1.0);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let theme_mode = theme::mode();
@@ -1538,34 +1635,46 @@ impl App {
             });
     }
 
-    /// Recomputes find matches when the query or document changed.
-    fn update_find_matches(&mut self) {
+    /// Recomputes the find matches when the query or the document changed.
+    ///
+    /// Never moves the caret or the preview. Returns `true` when the query
+    /// changed, so the caller can reveal the first match of the new query.
+    fn update_find_matches(&mut self) -> bool {
         if self.find_cache.0 == self.find_query && self.find_cache.1 == self.preview_revision {
-            return;
+            return false;
+        }
+        let query_changed = self.find_cache.0 != self.find_query;
+        if query_changed {
+            self.find_index = 0;
         }
         self.find_cache = (self.find_query.clone(), self.preview_revision);
         self.find_matches.clear();
         let query = self.find_query.to_ascii_lowercase();
         if query.is_empty() {
-            self.find_index = 0;
-            return;
+            return query_changed;
         }
         let hay = self.text.to_ascii_lowercase();
         let mut start = 0usize;
         while let Some(pos) = hay[start..].find(&query) {
             let begin = start + pos;
             self.find_matches.push((begin, begin + query.len()));
-            start = begin + query.len().max(1);
+            start = begin + query.len();
         }
         if self.find_index >= self.find_matches.len() {
             self.find_index = 0;
         }
-        if !self.find_matches.is_empty() {
-            self.reveal_match(self.find_index);
+        query_changed
+    }
+
+    /// Scrolls the preview to source `line`. In Edit mode the caret moves there too.
+    fn jump_to_line(&mut self, line: usize) {
+        self.preview_line = Some(line);
+        if self.mode == ViewMode::Editor {
+            self.jump_line = Some(line);
         }
     }
 
-    /// Scrolls the preview (and the editor in split mode) to a match.
+    /// Makes match `index` the current one and scrolls to it.
     fn reveal_match(&mut self, index: usize) {
         let Some((start, _)) = self.find_matches.get(index).copied() else {
             return;
@@ -1575,32 +1684,23 @@ impl App {
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
-        self.preview_line = Some(line);
-        if self.mode == ViewMode::Editor {
-            self.jump_line = Some(line);
-        }
+        self.jump_to_line(line);
     }
 
     fn find_next(&mut self) {
         self.update_find_matches();
-        if self.find_matches.is_empty() {
-            return;
+        let count = self.find_matches.len();
+        if count > 0 {
+            self.reveal_match((self.find_index + 1) % count);
         }
-        let next = (self.find_index + 1) % self.find_matches.len();
-        self.reveal_match(next);
     }
 
     fn find_prev(&mut self) {
         self.update_find_matches();
-        if self.find_matches.is_empty() {
-            return;
+        let count = self.find_matches.len();
+        if count > 0 {
+            self.reveal_match((self.find_index + count - 1) % count);
         }
-        let prev = if self.find_index == 0 {
-            self.find_matches.len() - 1
-        } else {
-            self.find_index - 1
-        };
-        self.reveal_match(prev);
     }
 
     /// Replaces the current match and advances to the next one.
@@ -1609,25 +1709,31 @@ impl App {
         let Some((start, end)) = self.find_matches.get(self.find_index).copied() else {
             return;
         };
-        self.text.replace_range(start..end, &self.replace_text);
-        self.dirty = true;
-        self.reparse();
-        self.find_cache = (String::new(), 0);
+        if self.text[start..end] != *self.replace_text {
+            self.text.replace_range(start..end, &self.replace_text);
+            self.dirty = true;
+            self.reparse();
+        }
+        // Search after the inserted text, so a replacement that contains the
+        // query is not matched again.
+        let after = start + self.replace_text.len();
         self.update_find_matches();
         let next = self
             .find_matches
             .iter()
-            .position(|(match_start, _)| *match_start >= start)
+            .position(|(match_start, _)| *match_start >= after)
             .unwrap_or(0);
-        if !self.find_matches.is_empty() {
-            self.reveal_match(next);
-        }
+        self.reveal_match(next);
     }
 
     /// Replaces every match in one pass.
     fn replace_all(&mut self) {
         self.update_find_matches();
-        if self.find_matches.is_empty() {
+        let changed = self
+            .find_matches
+            .iter()
+            .any(|(start, end)| self.text[*start..*end] != *self.replace_text);
+        if !changed {
             return;
         }
         let matches = std::mem::take(&mut self.find_matches);
@@ -1636,17 +1742,15 @@ impl App {
         }
         self.dirty = true;
         self.reparse();
-        self.find_cache = (String::new(), 0);
         self.update_find_matches();
-        self.find_index = 0;
-        if !self.find_matches.is_empty() {
-            self.reveal_match(0);
-        }
+        self.reveal_match(0);
     }
 
     /// Find/replace bar below the toolbar.
     fn find_bar(&mut self, ui: &mut Ui) {
-        self.update_find_matches();
+        if self.update_find_matches() {
+            self.reveal_match(self.find_index);
+        }
         egui::Panel::top("findbar")
             .frame(
                 Frame::new()
@@ -1719,27 +1823,35 @@ impl App {
             });
     }
 
-    /// Top-level headings with their source lines, for the outline sidebar.
-    fn outline_entries(&self) -> Vec<(u8, usize, String)> {
-        self.doc
-            .blocks
-            .iter()
-            .zip(self.doc.block_lines.iter())
-            .filter_map(|(block, line)| {
-                if let Block::Heading { level, inlines } = block {
-                    let text: String = inlines.iter().map(|i| i.plain_text()).collect();
-                    Some((*level, *line, text))
-                } else {
-                    None
-                }
-            })
-            .collect()
+    /// Rebuilds the outline (top-level headings with their source lines) when
+    /// the preview has changed.
+    fn refresh_outline(&mut self) {
+        if self.outline_revision == self.preview_revision {
+            return;
+        }
+        self.outline_revision = self.preview_revision;
+        self.outline = Arc::new(
+            self.doc
+                .blocks
+                .iter()
+                .zip(self.doc.block_lines.iter())
+                .filter_map(|(block, line)| {
+                    if let Block::Heading { level, inlines } = block {
+                        let text: String = inlines.iter().map(|i| i.plain_text()).collect();
+                        Some((*level, *line, text))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        );
     }
 
     /// Collapsible outline sidebar. Clicking a heading scrolls the preview and
     /// moves the editor caret to that section.
     fn outline_panel(&mut self, ui: &mut Ui) {
-        let entries = self.outline_entries();
+        self.refresh_outline();
+        let entries = Arc::clone(&self.outline);
         let active_line = if self.mode == ViewMode::Editor {
             self.last_cursor.0
         } else {
@@ -1797,8 +1909,7 @@ impl App {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                                 if response.clicked() {
-                                    self.preview_line = Some(*line);
-                                    self.jump_line = Some(*line);
+                                    self.jump_to_line(*line);
                                 }
                             });
                         }
@@ -1977,6 +2088,7 @@ impl App {
                 let doc = &self.doc;
                 let text = &mut self.text;
                 let last_cursor = &mut self.last_cursor;
+                let cursor_key = &mut self.cursor_key;
                 let math_cache = &mut self.math_cache;
                 let preview_line = &mut self.preview_line;
                 let preview_top_line = &mut self.preview_top_line;
@@ -2005,7 +2117,15 @@ impl App {
                                     ui.set_width(inner_left);
                                     ui.set_height(total_h);
                                     ui.add_space(16.0);
-                                    changed = editor_ui(ui, text, f, last_cursor, &mut jump_line);
+                                    changed = editor_ui(
+                                        ui,
+                                        text,
+                                        f,
+                                        last_cursor,
+                                        cursor_key,
+                                        preview_revision,
+                                        &mut jump_line,
+                                    );
                                 });
                                 ui.add_space(24.0);
                             });
@@ -2045,7 +2165,7 @@ impl App {
                                     ui.set_width(inner_right);
                                     ui.set_height(total_h);
                                     ui.add_space(16.0);
-                                    preview_ui(
+                                    source_jump = preview_ui(
                                         ui,
                                         doc,
                                         f,
@@ -2053,7 +2173,6 @@ impl App {
                                         false,
                                         &mut image_click,
                                         math_cache,
-                                        &mut source_jump,
                                         preview_line,
                                         preview_top_line,
                                         preview_metrics,
@@ -2085,7 +2204,8 @@ impl App {
             .show(ui, |ui| {
                 let base_dir = self.base_dir();
                 let mut image_click = None;
-                let mut source_jump = None;
+                // Clicks in the preview only move the caret in Edit mode, so the
+                // returned source line is ignored here.
                 preview_ui(
                     ui,
                     &self.doc,
@@ -2094,15 +2214,11 @@ impl App {
                     true,
                     &mut image_click,
                     &mut self.math_cache,
-                    &mut source_jump,
                     &mut self.preview_line,
                     &mut self.preview_top_line,
                     &mut self.preview_metrics,
                     self.preview_revision,
                 );
-                if source_jump.is_some() {
-                    self.jump_line = source_jump;
-                }
                 if let Some(request) = image_click {
                     self.image_viewer = Some(ImageViewer::new(request));
                 }
@@ -2111,8 +2227,8 @@ impl App {
 
     /// Asks whether unsaved changes should be written before the window closes.
     ///
-    /// A native window close is intercepted in [`App::ui`] while any tab is
-    /// dirty. With multiple dirty tabs the sheet offers **Save All**; otherwise
+    /// A native window close is intercepted in [`App::guard_window_close`]
+    /// while any tab is dirty. With multiple dirty tabs the sheet offers **Save All**; otherwise
     /// it mirrors the macOS save-changes sheet. Esc is Cancel, Enter is Save.
     fn show_close_dialog(&mut self, ctx: &egui::Context) {
         if !self.close_dialog {
@@ -2172,13 +2288,7 @@ impl App {
         let mut check = false;
         let modal = egui::Modal::new(egui::Id::unique("weasyprint_onboarding"))
             .backdrop_color(Color32::from_black_alpha(150))
-            .frame(
-                Frame::new()
-                    .fill(palette().bg3)
-                    .stroke(Stroke::new(1.0, palette().faint))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(20)),
-            )
+            .frame(modal_frame())
             .show(ctx, |ui| {
                 ui.set_width(dialog_w);
                 ui.label(
@@ -2187,12 +2297,7 @@ impl App {
                         .color(palette().text),
                 );
                 ui.add_space(8.0);
-                let (rule, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 1.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rule, CornerRadius::ZERO, palette().stroke);
+                hairline(ui);
                 ui.add_space(14.0);
                 ui.label(
                     RichText::new(
@@ -2239,46 +2344,13 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     ui.spacing_mut().button_padding = Vec2::new(14.0, 6.0);
 
-                    let close_button = egui::Button::new(
-                        RichText::new("Continue without PDF")
-                            .size(14.0)
-                            .color(palette().text),
-                    )
-                    .fill(palette().bg2)
-                    .stroke(Stroke::new(1.2, palette().faint))
-                    .corner_radius(CornerRadius::same(16))
-                    .min_size(Vec2::new(170.0, 32.0));
-                    if ui.add(close_button).clicked() {
+                    if modal_button(ui, "Continue without PDF", 14.0, false, 170.0).clicked() {
                         close = true;
                     }
-
-                    let check_button = egui::Button::new(
-                        RichText::new("Check again")
-                            .size(14.0)
-                            .color(Color32::WHITE),
-                    )
-                    .fill(palette().accent)
-                    .stroke(Stroke::new(2.0, palette().accent))
-                    .corner_radius(CornerRadius::same(18))
-                    .min_size(Vec2::new(120.0, 34.0));
-                    if ui.add(check_button).clicked() {
+                    if modal_button(ui, "Check again", 14.0, true, 120.0).clicked() {
                         check = true;
                     }
-
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("weasyprint.org")
-                                    .size(14.0)
-                                    .color(palette().text),
-                            )
-                            .fill(palette().bg2)
-                            .stroke(Stroke::new(1.2, palette().faint))
-                            .corner_radius(CornerRadius::same(16))
-                            .min_size(Vec2::new(130.0, 32.0)),
-                        )
-                        .clicked()
-                    {
+                    if modal_button(ui, "weasyprint.org", 14.0, false, 130.0).clicked() {
                         ui.ctx()
                             .open_url(egui::OpenUrl::new_tab("https://weasyprint.org/"));
                     }
@@ -2321,10 +2393,7 @@ impl App {
         match Self::unsaved_modal(ctx, "tab", &message, "Save") {
             Some(UnsavedChoice::Save) => {
                 self.switch_tab(index);
-                if let Err(e) = self.do_save() {
-                    self.set_status(format!("Save failed: {e}"), true);
-                }
-                if !self.dirty {
+                if self.do_save() {
                     self.pending_tab_close = None;
                     self.close_tab(index);
                 }
@@ -2350,13 +2419,7 @@ impl App {
         let dialog_w = (ctx.content_rect().width() - 200.0).clamp(400.0, 540.0);
         let modal = egui::Modal::new(egui::Id::unique(("unsaved_modal", id)))
             .backdrop_color(Color32::from_black_alpha(150))
-            .frame(
-                Frame::new()
-                    .fill(palette().bg3)
-                    .stroke(Stroke::new(1.0, palette().faint))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(20)),
-            )
+            .frame(modal_frame())
             .show(ctx, |ui| {
                 ui.set_width(dialog_w);
                 ui.label(
@@ -2384,35 +2447,13 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     ui.spacing_mut().button_padding = Vec2::new(18.0, 7.0);
 
-                    let save = egui::Button::new(
-                        RichText::new(save_label).size(14.5).color(Color32::WHITE),
-                    )
-                    .fill(palette().accent)
-                    .stroke(Stroke::new(2.0, palette().accent))
-                    .corner_radius(CornerRadius::same(18))
-                    .min_size(Vec2::new(120.0, 34.0));
-                    if ui.add(save).clicked() {
+                    if modal_button(ui, save_label, 14.5, true, 120.0).clicked() {
                         choice = Some(UnsavedChoice::Save);
                     }
-
-                    let cancel =
-                        egui::Button::new(RichText::new("Cancel").size(14.5).color(palette().text))
-                            .fill(palette().bg2)
-                            .stroke(Stroke::new(1.2, palette().faint))
-                            .corner_radius(CornerRadius::same(16))
-                            .min_size(Vec2::new(100.0, 32.0));
-                    if ui.add(cancel).clicked() {
+                    if modal_button(ui, "Cancel", 14.5, false, 100.0).clicked() {
                         choice = Some(UnsavedChoice::Cancel);
                     }
-
-                    let dont = egui::Button::new(
-                        RichText::new("Don't Save").size(14.5).color(palette().text),
-                    )
-                    .fill(palette().bg2)
-                    .stroke(Stroke::new(1.2, palette().faint))
-                    .corner_radius(CornerRadius::same(16))
-                    .min_size(Vec2::new(130.0, 32.0));
-                    if ui.add(dont).clicked() {
+                    if modal_button(ui, "Don't Save", 14.5, false, 130.0).clicked() {
                         choice = Some(UnsavedChoice::Discard);
                     }
                 });
@@ -2469,7 +2510,7 @@ impl App {
                             .font(bold_font(15.0))
                             .color(palette().text),
                     )
-                    .on_hover_text(&viewer.url);
+                    .on_hover_text(&viewer.request.url);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Close (Esc)").clicked() {
                             close = true;
@@ -2512,7 +2553,7 @@ impl App {
                 let clip = rect.shrink(1.0);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(clip), |ui| {
                     ui.set_clip_rect(clip);
-                    let image = egui::Image::new(viewer.uri.as_str())
+                    let image = egui::Image::new(viewer.request.uri.as_str())
                         .fit_to_original_size(1.0)
                         .sense(egui::Sense::hover())
                         .alt_text(viewer.title());
@@ -2533,7 +2574,7 @@ impl App {
                     };
 
                     egui::Scene::new()
-                        .zoom_range(0.05..=8.0)
+                        .zoom_range(IMAGE_ZOOM_MIN..=IMAGE_ZOOM_MAX)
                         .scroll_zooms(true)
                         .show(ui, &mut scene_rect, |ui| {
                             ui.add(image);
@@ -2557,7 +2598,7 @@ impl App {
     /// Bottom status bar: transient messages, cursor position, statistics.
     fn status_bar(&mut self, ui: &mut Ui) {
         if let Some((_, _, at)) = self.status
-            && at.elapsed() > std::time::Duration::from_secs(4)
+            && at.elapsed() > STATUS_DURATION
         {
             self.status = None;
         }
@@ -2595,37 +2636,36 @@ impl App {
     }
 }
 
-/// Installs macOS system fonts as the primary UI fonts.
+/// Installs the system fonts used for the UI, with fallbacks.
 ///
-/// * Body text: **Helvetica Neue** (TTC faces 0–3: regular/bold/italic/bold-italic)
-/// * Code: **SF Mono**
+/// * Body text: **SF Pro** (`SFNS.ttf`, a variable font), with real bold and
+///   italic cuts from `SFNSItalic.ttf`; the optical size is fixed at 17 for
+///   comfortable reading. Without SF Pro, **Helvetica Neue** (TTC faces 0–3:
+///   regular/bold/italic/bold-italic) is used.
+/// * Code: **SF Mono**.
 ///
 /// The font files are read from the system at runtime (never bundled), so the
 /// app keeps the native macOS look without licensing issues. Custom families
 /// (`bold`, `italic`, `bold-italic`) make real bold/italic text possible —
 /// egui's default font has no separate bold face.
-/// Installs the single, fixed UI font: **SF Pro** (San Francisco), Apple's
-/// system font, with SF Mono for code.
-///
-/// `SFNS.ttf` is a variable font; epaint can select its `wght` and `opsz`
-/// axes, so regular/bold/italic are real cuts rather than synthesized. Text
-/// optical size (`opsz` 17) is used for comfortable reading at body sizes.
-/// On systems without SF Pro the loader falls back to Helvetica Neue.
 fn install_system_fonts(ctx: &egui::Context) {
     use egui::epaint::text::VariationCoords;
     use egui::{FontData, FontDefinitions, FontFamily};
-    use std::sync::Arc;
 
-    /// Adds one face from `blob` at `weight` to the front of `family`.
+    /// Adds the face `index` of `blob` to the front of `family`. `weight` sets
+    /// the variable-font axes; `None` keeps a static face as it is.
     fn add_face(
         fonts: &mut FontDefinitions,
         blob: &Arc<Vec<u8>>,
+        index: u32,
         name: &str,
-        weight: f32,
         family: FontFamily,
+        weight: Option<f32>,
     ) {
-        let mut data = FontData::from_blob(blob.clone(), 0);
-        data.tweak.coords = VariationCoords::new([(b"wght", weight), (b"opsz", 17.0)]);
+        let mut data = FontData::from_blob(blob.clone(), index);
+        if let Some(weight) = weight {
+            data.tweak.coords = VariationCoords::new([(b"wght", weight), (b"opsz", 17.0)]);
+        }
         fonts.font_data.insert(name.to_owned(), Arc::new(data));
         fonts
             .families
@@ -2641,13 +2681,21 @@ fn install_system_fonts(ctx: &egui::Context) {
         .ok()
         .map(Arc::new);
     if let Some(sf) = &sf {
-        add_face(&mut fonts, sf, "sf-pro", 400.0, FontFamily::Proportional);
         add_face(
             &mut fonts,
             sf,
+            0,
+            "sf-pro",
+            FontFamily::Proportional,
+            Some(400.0),
+        );
+        add_face(
+            &mut fonts,
+            sf,
+            0,
             "sf-pro-bold",
-            700.0,
             FontFamily::Name("bold".into()),
+            Some(700.0),
         );
     }
     // SF Pro italic + bold italic.
@@ -2656,16 +2704,18 @@ fn install_system_fonts(ctx: &egui::Context) {
         add_face(
             &mut fonts,
             &italic,
+            0,
             "sf-pro-italic",
-            400.0,
             FontFamily::Name("italic".into()),
+            Some(400.0),
         );
         add_face(
             &mut fonts,
             &italic,
+            0,
             "sf-pro-bold-italic",
-            700.0,
             FontFamily::Name("bold-italic".into()),
+            Some(700.0),
         );
     }
 
@@ -2674,36 +2724,30 @@ fn install_system_fonts(ctx: &egui::Context) {
         && let Ok(bytes) = std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc")
     {
         let blob = Arc::new(bytes);
-        let mut add = |name: &str, index: u32, family: FontFamily| {
-            fonts.font_data.insert(
-                name.to_owned(),
-                Arc::new(FontData::from_blob(blob.clone(), index)),
-            );
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .insert(0, name.to_owned());
-        };
-        add("helv-neue", 0, FontFamily::Proportional);
-        add("helv-neue-bold", 1, FontFamily::Name("bold".into()));
-        add("helv-neue-italic", 2, FontFamily::Name("italic".into()));
-        add(
-            "helv-neue-bold-italic",
-            3,
-            FontFamily::Name("bold-italic".into()),
-        );
+        let faces = [
+            ("helv-neue", 0, FontFamily::Proportional),
+            ("helv-neue-bold", 1, FontFamily::Name("bold".into())),
+            ("helv-neue-italic", 2, FontFamily::Name("italic".into())),
+            (
+                "helv-neue-bold-italic",
+                3,
+                FontFamily::Name("bold-italic".into()),
+            ),
+        ];
+        for (name, index, family) in faces {
+            add_face(&mut fonts, &blob, index, name, family, None);
+        }
     }
 
     if let Ok(mono) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") {
-        fonts
-            .font_data
-            .insert("sf-mono".into(), Arc::new(FontData::from_owned(mono)));
-        fonts
-            .families
-            .entry(FontFamily::Monospace)
-            .or_default()
-            .insert(0, "sf-mono".into());
+        add_face(
+            &mut fonts,
+            &Arc::new(mono),
+            0,
+            "sf-mono",
+            FontFamily::Monospace,
+            None,
+        );
     }
 
     ctx.set_fonts(fonts);
@@ -2739,6 +2783,24 @@ fn editor_copy(ctx: &egui::Context, text: &str, range: Option<egui::text::CCurso
     true
 }
 
+/// Id of the cached editor selection, restored when a context menu is open.
+fn selection_cache_id() -> egui::Id {
+    egui::Id::unique("md_editor_selection_cache")
+}
+
+/// Forgets the cached editor selection.
+fn clear_selection_cache(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<egui::text::CCursorRange>(selection_cache_id()));
+}
+
+/// Moves the caret or selection of the editor `id` and focuses the editor.
+fn set_editor_cursor(ctx: &egui::Context, id: egui::Id, range: egui::text::CCursorRange) {
+    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(range));
+    state.store(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id));
+}
+
 /// Cuts the selected text and updates the stored cursor position.
 ///
 /// Returns the new cursor (for the status bar), or `None` if nothing was
@@ -2752,15 +2814,8 @@ fn editor_cut(
     let range = range.filter(|r| !r.is_empty())?;
     ctx.copy_text(range.slice_str(text).to_string());
     let new_cursor = egui::TextBuffer::delete_selected(text, &range);
-    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-    state
-        .cursor
-        .set_char_range(Some(egui::text::CCursorRange::one(new_cursor)));
-    state.store(ctx, id);
-    ctx.data_mut(|d| {
-        d.remove::<egui::text::CCursorRange>(egui::Id::unique("md_editor_selection_cache"));
-    });
-    ctx.memory_mut(|memory| memory.request_focus(id));
+    set_editor_cursor(ctx, id, egui::text::CCursorRange::one(new_cursor));
+    clear_selection_cache(ctx);
     Some(new_cursor)
 }
 
@@ -2770,28 +2825,22 @@ fn editor_cut(
 /// which the focused `TextEdit` then applies with its normal undo/selection
 /// handling.
 fn editor_paste(ctx: &egui::Context, id: egui::Id) {
-    ctx.data_mut(|d| {
-        d.remove::<egui::text::CCursorRange>(egui::Id::unique("md_editor_selection_cache"));
-    });
+    clear_selection_cache(ctx);
     ctx.memory_mut(|memory| memory.request_focus(id));
     ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
 }
 
 /// Selects the whole editor buffer.
 fn editor_select_all(ctx: &egui::Context, text: &str, id: egui::Id) {
-    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
     let selection = egui::text::CCursorRange::select_all_str(text);
-    state.cursor.set_char_range(Some(selection));
-    state.store(ctx, id);
-    ctx.data_mut(|d| {
-        d.insert_temp(egui::Id::unique("md_editor_selection_cache"), selection);
-    });
-    ctx.memory_mut(|memory| memory.request_focus(id));
+    set_editor_cursor(ctx, id, selection);
+    ctx.data_mut(|d| d.insert_temp(selection_cache_id(), selection));
 }
 
 /// Raw Markdown editor body. Returns `true` if the text changed.
 ///
-/// Used inside the Edit split screen (left half).
+/// Used inside the Edit split screen (left half). `cursor_key` caches the
+/// status-bar line and column per character index and preview revision.
 ///
 /// Keyboard Cmd+X/C/V is handled by egui's `TextEdit`. This function adds a
 /// right-click menu and Ctrl+X/C/V fallbacks so clipboard actions also work
@@ -2801,6 +2850,8 @@ fn editor_ui(
     text: &mut String,
     font_size: f32,
     last_cursor: &mut (usize, usize),
+    cursor_key: &mut Option<(usize, u64)>,
+    revision: u64,
     jump_line: &mut Option<usize>,
 ) -> bool {
     let ctx = ui.ctx().clone();
@@ -2816,7 +2867,6 @@ fn editor_ui(
             // context menu is open.
             let editor_id = ui.make_persistent_id(egui::IdSalt::new("md_editor"));
             let menu_pos_id = egui::Id::unique("md_editor_context_menu_pos");
-            let selection_cache = egui::Id::unique("md_editor_selection_cache");
             let menu_open = ctx
                 .data(|d| d.get_temp::<egui::Pos2>(menu_pos_id))
                 .is_some();
@@ -2825,7 +2875,7 @@ fn editor_ui(
                     || i.pointer.button_clicked(egui::PointerButton::Secondary)
             });
             let cached_selection = ctx
-                .data(|d| d.get_temp::<egui::text::CCursorRange>(selection_cache))
+                .data(|d| d.get_temp::<egui::text::CCursorRange>(selection_cache_id()))
                 .filter(|range| !range.is_empty());
 
             // Right-clicking normally collapses the TextEdit selection. While
@@ -2835,26 +2885,18 @@ fn editor_ui(
             if (menu_open || secondary_active)
                 && let Some(selection) = cached_selection
             {
-                let mut state = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
-                    .unwrap_or_default();
-                state.cursor.set_char_range(Some(selection));
-                state.store(&ctx, editor_id);
-                ctx.memory_mut(|memory| memory.request_focus(editor_id));
+                set_editor_cursor(&ctx, editor_id, selection);
             }
 
             // A click in the preview requests a jump; move the text cursor
             // before the widget is shown so the selection and caret follow.
             if let Some(line) = jump {
                 let index = line_to_char_index(text, line);
-                let mut state = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
-                    .unwrap_or_default();
-                state
-                    .cursor
-                    .set_char_range(Some(egui::text::CCursorRange::one(
-                        egui::text::CCursor::new(index),
-                    )));
-                state.store(&ctx, editor_id);
-                ctx.memory_mut(|memory| memory.request_focus(editor_id));
+                set_editor_cursor(
+                    &ctx,
+                    editor_id,
+                    egui::text::CCursorRange::one(egui::text::CCursor::new(index)),
+                );
             }
 
             let out = egui::TextEdit::multiline(text)
@@ -2877,13 +2919,14 @@ fn editor_ui(
             }
             if out.response.response.changed() {
                 changed = true;
-                ctx.data_mut(|d| {
-                    d.remove::<egui::text::CCursorRange>(selection_cache);
-                });
+                clear_selection_cache(&ctx);
             }
             if let Some(range) = &out.cursor_range {
-                let idx = range.primary.index.0;
-                *last_cursor = char_to_line_col(text, idx);
+                let index = range.primary.index.0;
+                if changed || *cursor_key != Some((index, revision)) {
+                    *cursor_key = Some((index, revision));
+                    *last_cursor = char_to_line_col(text, index);
+                }
             }
 
             let id = out.response.response.id;
@@ -2892,20 +2935,17 @@ fn editor_ui(
             let secondary_click = out.response.response.secondary_clicked();
             let mut range = out.cursor_range;
 
-            // Remember a real selection so it can be restored while the
-            // context menu is open. Do not clear it during a right-click.
-            if let Some(selection) = out.cursor_range.filter(|r| !r.is_empty()) {
-                if !menu_open && !secondary_down {
-                    ctx.data_mut(|d| d.insert_temp(selection_cache, selection));
+            // Keep a real selection so it can be restored while the context
+            // menu is open. An empty live selection (caret moved by keys or
+            // clicks) drops it, unless a right-click or the menu is in progress.
+            match out.cursor_range.filter(|r| !r.is_empty()) {
+                Some(selection) if !menu_open && !secondary_down => {
+                    ctx.data_mut(|d| d.insert_temp(selection_cache_id(), selection));
                 }
-            } else if !menu_open
-                && !secondary_down
-                && !secondary_click
-                && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
-            {
-                ctx.data_mut(|d| {
-                    d.remove::<egui::text::CCursorRange>(selection_cache);
-                });
+                None if !menu_open && !secondary_down && !secondary_click => {
+                    clear_selection_cache(&ctx);
+                }
+                _ => {}
             }
 
             if (menu_open || secondary_down || secondary_click)
@@ -3029,6 +3069,7 @@ fn editor_ui(
 /// Used by the full-window Preview and by the right half of the Edit split.
 /// A click on an inline image is written to `image_click`; the caller opens
 /// the modal viewer after rendering (this function only borrows the document).
+/// Returns the source line of a click on a block; only Edit mode acts on it.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the render pipeline; each argument is a distinct input"
@@ -3041,22 +3082,21 @@ fn preview_ui(
     full_width: bool,
     image_click: &mut Option<ImageRequest>,
     math_cache: &mut MathCache,
-    source_jump: &mut Option<usize>,
     preview_line: &mut Option<usize>,
     preview_top_line: &mut usize,
     metrics: &mut PreviewMetrics,
     revision: u64,
-) {
+) -> Option<usize> {
     let mut hits: Vec<SourceHit> = Vec::new();
     let virtualize = doc.blocks.len() > VIRTUALIZE_THRESHOLD;
 
-    let output = if virtualize {
-        ScrollArea::vertical()
-            .id_salt("preview_scroll")
-            .auto_shrink([false; 2])
-            .show_viewport(ui, |ui, viewport| {
-                ui.add_space(24.0);
-                preview_column(ui, f, full_width, |ui| {
+    let output = ScrollArea::vertical()
+        .id_salt("preview_scroll")
+        .auto_shrink([false; 2])
+        .show_viewport(ui, |ui, viewport| {
+            ui.add_space(24.0);
+            preview_column(ui, f, full_width, |ui| {
+                if virtualize {
                     let width = ui.available_width().max(1.0);
                     let key = PreviewKey {
                         revision,
@@ -3072,29 +3112,34 @@ fn preview_ui(
                             .map(|block| estimate_block_height(block, f, width))
                             .collect();
                     }
+                }
 
-                    let before_front = ui.cursor().top();
-                    render_front_matter(ui, doc, f);
-                    let front_height = (ui.cursor().top() - before_front).max(0.0);
-                    let mut y = 24.0 + front_height;
+                let before_front = ui.cursor().top();
+                render_front_matter(ui, doc, f);
+                let front_height = (ui.cursor().top() - before_front).max(0.0);
+                let mut y = 24.0 + front_height;
 
-                    // Scroll to the block containing the requested source line.
-                    if let Some(target) = preview_line.take() {
-                        let index = preview_index_for_line(&doc.block_lines, target);
-                        let offset =
-                            24.0 + front_height + metrics.heights[..index].iter().sum::<f32>();
-                        let height = metrics.heights[index];
-                        let screen_y = ui.clip_rect().top() + (offset - viewport.min.y);
-                        ui.scroll_to_rect(
-                            Rect::from_min_size(
-                                egui::pos2(ui.clip_rect().left(), screen_y),
-                                Vec2::new(1.0, height),
-                            ),
-                            Some(Align::Min),
-                        );
-                    }
+                // Scroll to the block containing the requested source line. The
+                // virtual path needs the offset up front; the full path scrolls
+                // to the rendered block after the loop.
+                let target = preview_line.take();
+                if let Some(target) = target.filter(|_| virtualize) {
+                    let index = preview_index_for_line(&doc.block_lines, target)
+                        .min(metrics.heights.len() - 1);
+                    let offset = 24.0 + front_height + metrics.heights[..index].iter().sum::<f32>();
+                    let height = metrics.heights[index];
+                    let screen_y = ui.clip_rect().top() + (offset - viewport.min.y);
+                    ui.scroll_to_rect(
+                        Rect::from_min_size(
+                            egui::pos2(ui.clip_rect().left(), screen_y),
+                            Vec2::new(1.0, height),
+                        ),
+                        Some(Align::Min),
+                    );
+                }
 
-                    for (index, block) in doc.blocks.iter().enumerate() {
+                for (index, block) in doc.blocks.iter().enumerate() {
+                    if virtualize {
                         let height = metrics.heights[index];
                         if y > viewport.max.y + PREVIEW_OVERSCAN {
                             ui.add_space(metrics.heights[index..].iter().sum());
@@ -3105,81 +3150,42 @@ fn preview_ui(
                             y += height;
                             continue;
                         }
-
-                        let top = ui.cursor().top();
-                        let x0 = ui.cursor().left();
-                        let width = ui.available_width();
-                        ui.push_id(("preview_block", index), |ui| {
-                            render_block(
-                                ui,
-                                block,
-                                f,
-                                1,
-                                base_dir,
-                                image_click,
-                                math_cache,
-                                &[],
-                                &mut Vec::new(),
-                            );
-                        });
-                        let actual = (ui.cursor().top() - top).max(1.0);
-                        metrics.heights[index] = actual;
-                        hits.push((
-                            Rect::from_min_size(egui::pos2(x0, top), Vec2::new(width, actual)),
-                            doc.block_lines.get(index).copied().unwrap_or(1),
-                        ));
-                        y += actual;
                     }
-
-                    render_footnotes(ui, doc, f, base_dir, image_click, math_cache, &mut hits);
-                    ui.add_space(72.0);
-                });
-            })
-    } else {
-        ScrollArea::vertical()
-            .id_salt("preview_scroll")
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                ui.add_space(24.0);
-                preview_column(ui, f, full_width, |ui| {
-                    render_front_matter(ui, doc, f);
-                    render_blocks(
-                        ui,
-                        &doc.blocks,
-                        f,
-                        0,
-                        base_dir,
-                        image_click,
-                        math_cache,
-                        &doc.block_lines,
-                        &mut hits,
-                    );
-                    // Mode switch Editor → Preview: scroll to the block that
-                    // contains the editor caret line (the last block starting at
-                    // or before it).
-                    if let Some(target) = preview_line.take()
-                        && let Some((rect, _)) = block_at_line(&hits, target)
-                    {
-                        ui.scroll_to_rect(rect, Some(Align::Min));
+                    let rect =
+                        render_top_level(ui, index, block, f, base_dir, image_click, math_cache);
+                    if virtualize {
+                        metrics.heights[index] = rect.height();
+                        y += rect.height();
                     }
-                    render_footnotes(ui, doc, f, base_dir, image_click, math_cache, &mut hits);
-                    ui.add_space(72.0);
-                });
-            })
-    };
+                    hits.push((rect, doc.block_lines.get(index).copied().unwrap_or(1)));
+                }
+
+                // Mode switch Editor → Preview: scroll to the block that
+                // contains the editor caret line (the last block starting at
+                // or before it).
+                if let Some(target) = target.filter(|_| !virtualize)
+                    && let Some((rect, _)) = block_at_line(&hits, target)
+                {
+                    ui.scroll_to_rect(rect, Some(Align::Min));
+                }
+                render_footnotes(ui, doc, f, base_dir, image_click, math_cache);
+                ui.add_space(72.0);
+            });
+        });
 
     if let Some(line) = top_visible_line(&hits, output.inner_rect) {
         *preview_top_line = line;
     }
 
-    // Click in the preview → ask the editor to jump to the matching source line.
+    // Click in the preview → the source line the caller should jump to.
     if ui.input(|i| i.pointer.primary_clicked())
         && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
         && let Some(line) = source_line_at(&hits, pos)
     {
-        *source_jump = Some(line);
         ui.ctx().request_repaint();
+        return Some(line);
     }
+    None
 }
 
 /// Index of the top-level block containing source line `target`.
@@ -3195,15 +3201,16 @@ fn preview_index_for_line(lines: &[usize], target: usize) -> usize {
 /// size the scroll bar of very large documents; visible blocks are measured
 /// precisely after rendering.
 fn estimate_block_height(block: &Block, f: f32, width: f32) -> f32 {
-    let chars_per_line = (width / (f * 0.55)).max(8.0);
-    let text = block.summarize();
-    let lines = (text.chars().count() as f32 / chars_per_line)
-        .ceil()
-        .max(1.0);
-    let body = lines * f * 1.5 + 10.0;
     match block {
         Block::Heading { .. } => f * 1.8 + 18.0,
-        Block::Paragraph(_) => body,
+        Block::Paragraph(_) => {
+            let chars_per_line = (width / (f * 0.55)).max(8.0);
+            let text = block.summarize();
+            let lines = (text.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0);
+            lines * f * 1.5 + 10.0
+        }
         Block::CodeBlock { code, .. } => (code.lines().count().max(1) as f32) * (f * 1.35) + 22.0,
         Block::List { items, .. } => (items.len().max(1) as f32) * (f * 1.8) + 10.0,
         Block::Table { rows, .. } => ((rows.len() + 1) as f32) * (f * 2.0) + 16.0,
@@ -3383,66 +3390,75 @@ fn block_at_line(hits: &[SourceHit], target: usize) -> Option<SourceHit> {
         .copied()
 }
 
-/// Renders a list of blocks, giving each a stable egui id scope.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recursive renderer with shared preview-sync context"
-)]
+/// Renders one top-level block in its own id scope and returns the rectangle
+/// it occupies. Both preview paths use it, so the id and the measurement stay
+/// identical whether or not the document is virtualized.
+fn render_top_level(
+    ui: &mut Ui,
+    index: usize,
+    block: &Block,
+    f: f32,
+    base_dir: Option<&Path>,
+    image_click: &mut Option<ImageRequest>,
+    math_cache: &mut MathCache,
+) -> Rect {
+    let top = ui.cursor().top();
+    let x0 = ui.cursor().left();
+    let width = ui.available_width();
+    ui.push_id(("preview_block", index), |ui| {
+        render_block(ui, block, f, base_dir, image_click, math_cache);
+    });
+    let height = (ui.cursor().top() - top).max(1.0);
+    Rect::from_min_size(egui::pos2(x0, top), Vec2::new(width, height))
+}
+
+/// Renders nested blocks (inside containers), each with a stable id scope.
 fn render_blocks(
     ui: &mut Ui,
     blocks: &[Block],
     f: f32,
-    depth: usize,
     base_dir: Option<&Path>,
     image_click: &mut Option<ImageRequest>,
     math_cache: &mut MathCache,
-    block_lines: &[usize],
-    hits: &mut Vec<SourceHit>,
 ) {
     for (i, block) in blocks.iter().enumerate() {
-        let y0 = ui.cursor().top();
-        let x0 = ui.cursor().left();
-        let width = ui.available_width();
-        ui.push_id((depth, i), |ui| {
-            render_block(
-                ui,
-                block,
-                f,
-                depth + 1,
-                base_dir,
-                image_click,
-                math_cache,
-                block_lines,
-                hits,
-            );
+        ui.push_id(("nested_block", i), |ui| {
+            render_block(ui, block, f, base_dir, image_click, math_cache);
         });
-        if depth == 0 {
-            let height = (ui.cursor().top() - y0).max(1.0);
-            let line = block_lines.get(i).copied().unwrap_or(1);
-            hits.push((
-                Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(width, height)),
-                line,
-            ));
-        }
     }
+}
+
+/// Renders a paragraph's inlines as a wrapping run. A paragraph that is only a
+/// wiki embed (`![[Note]]`) is rendered as an embedded note block instead.
+fn render_paragraph(
+    ui: &mut Ui,
+    inlines: &[Inline],
+    f: f32,
+    base_dir: Option<&Path>,
+    image_click: &mut Option<ImageRequest>,
+    math_cache: &mut MathCache,
+) {
+    if let Some(path) = standalone_transclusion(inlines, base_dir) {
+        render_transclusion(ui, &path, f, image_click, math_cache);
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        // Spaces are part of the inline stream; no extra widget gap.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.spacing_mut().item_spacing.y = f * 0.35;
+        render_inlines(ui, inlines, f, base_dir, image_click, math_cache);
+    });
 }
 
 /// Renders one block. This is the on-screen counterpart of the print HTML
 /// rendering in `html_export.rs` and must handle every [`Block`] variant.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors render_blocks and the PDF block renderer"
-)]
 fn render_block(
     ui: &mut Ui,
     block: &Block,
     f: f32,
-    depth: usize,
     base_dir: Option<&Path>,
     image_click: &mut Option<ImageRequest>,
     math_cache: &mut MathCache,
-    block_lines: &[usize],
-    hits: &mut Vec<SourceHit>,
 ) {
     match block {
         Block::Heading { level, inlines } => {
@@ -3468,16 +3484,7 @@ fn render_block(
         }
 
         Block::Paragraph(inlines) => {
-            if let Some(path) = standalone_transclusion(inlines, base_dir) {
-                render_transclusion(ui, &path, f, image_click, math_cache);
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                // Spaces are part of the inline stream; no extra widget gap.
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.spacing_mut().item_spacing.y = f * 0.35;
-                render_inlines(ui, inlines, f, base_dir, image_click, math_cache);
-            });
+            render_paragraph(ui, inlines, f, base_dir, image_click, math_cache);
             ui.add_space(f * 0.35);
         }
 
@@ -3525,56 +3532,29 @@ fn render_block(
         } => {
             let id = ui.scope_id().with("details_open");
             let mut expanded = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(*open);
-            Frame::new()
-                .fill(palette().bg2)
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin {
-                    left: 14,
-                    right: 14,
-                    top: 10,
-                    bottom: 12,
-                })
-                .show(ui, |ui| {
-                    let arrow = if expanded { "▼" } else { "▶" };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(format!("{arrow} {summary}"))
-                                    .font(bold_font(f * 0.92))
-                                    .color(palette().text),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE),
-                        )
-                        .clicked()
-                    {
-                        expanded = !expanded;
-                        ui.data_mut(|d| d.insert_temp(id, expanded));
-                    }
-                    if expanded {
-                        ui.add_space(4.0);
-                        render_blocks(
-                            ui,
-                            blocks,
-                            f,
-                            depth,
-                            base_dir,
-                            image_click,
-                            math_cache,
-                            block_lines,
-                            hits,
-                        );
-                    }
-                });
+            card_frame(Margin {
+                left: 14,
+                right: 14,
+                top: 10,
+                bottom: 12,
+            })
+            .stroke(Stroke::NONE)
+            .show(ui, |ui| {
+                let heading = bold_font(f * 0.92);
+                if disclosure_button(ui, expanded, summary, heading, palette().text) {
+                    expanded = !expanded;
+                    ui.data_mut(|d| d.insert_temp(id, expanded));
+                }
+                if expanded {
+                    ui.add_space(4.0);
+                    render_blocks(ui, blocks, f, base_dir, image_click, math_cache);
+                }
+            });
             ui.add_space(f * 0.5);
         }
 
         Block::Media { kind, url } => {
-            let response = Frame::new()
-                .fill(palette().bg2)
-                .stroke(Stroke::new(1.0, palette().stroke))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 8))
+            let response = card_frame(Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -3634,50 +3614,25 @@ fn render_block(
 
         Block::FencedDiv { class, blocks } => {
             let label = fenced_div_label(class);
-            let lower = label.to_ascii_lowercase();
-            let color = if lower.contains("warning")
-                || lower.contains("caution")
-                || lower.contains("danger")
-            {
-                palette().red
-            } else if lower.contains("tip") || lower.contains("success") {
-                palette().green
-            } else if lower.contains("important") {
-                palette().purple
-            } else {
-                palette().accent
-            };
+            let color = fenced_div_color(&label);
             ui.add_space(f * 0.4);
-            Frame::new()
-                .fill(palette().bg2)
-                .corner_radius(CornerRadius::same(8))
-                .stroke(Stroke::new(1.0, color))
-                .inner_margin(Margin {
-                    left: 14,
-                    right: 14,
-                    top: 10,
-                    bottom: 12,
-                })
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(
-                        RichText::new(label.to_uppercase())
-                            .font(bold_font(f * 0.8))
-                            .color(color),
-                    );
-                    ui.add_space(4.0);
-                    render_blocks(
-                        ui,
-                        blocks,
-                        f,
-                        depth,
-                        base_dir,
-                        image_click,
-                        math_cache,
-                        block_lines,
-                        hits,
-                    );
-                });
+            card_frame(Margin {
+                left: 14,
+                right: 14,
+                top: 10,
+                bottom: 12,
+            })
+            .stroke(Stroke::new(1.0, color))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    RichText::new(label.to_uppercase())
+                        .font(bold_font(f * 0.8))
+                        .color(color),
+                );
+                ui.add_space(4.0);
+                render_blocks(ui, blocks, f, base_dir, image_click, math_cache);
+            });
             ui.add_space(f * 0.5);
         }
 
@@ -3691,17 +3646,7 @@ fn render_block(
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
                         ui.vertical(|ui| {
-                            render_blocks(
-                                ui,
-                                def,
-                                f,
-                                depth,
-                                base_dir,
-                                image_click,
-                                math_cache,
-                                block_lines,
-                                hits,
-                            );
+                            render_blocks(ui, def, f, base_dir, image_click, math_cache);
                         });
                     });
                 }
@@ -3709,26 +3654,13 @@ fn render_block(
             ui.add_space(f * 0.3);
         }
 
-        Block::Group(blocks) => render_blocks(
-            ui,
-            blocks,
-            f,
-            depth,
-            base_dir,
-            image_click,
-            math_cache,
-            &[],
-            hits,
-        ),
+        Block::Group(blocks) => render_blocks(ui, blocks, f, base_dir, image_click, math_cache),
 
         Block::Html(src) => render_code(ui, Some("html — sanitized"), src, f),
 
         Block::Rule => {
             ui.add_space(f * 0.7);
-            let (rect, _) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, CornerRadius::ZERO, palette().stroke);
+            hairline(ui);
             ui.add_space(f * 0.7);
         }
 
@@ -3769,64 +3701,39 @@ fn render_block(
             // the arrow still lets the user collapse it.
             let open_id = ui.scope_id().with("callout_open");
             let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
-            let inner = Frame::new()
-                .fill(palette().bg2)
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin {
-                    left: 18,
-                    right: 16,
-                    top: 12,
-                    bottom: 12,
-                })
-                .show(ui, |ui| {
-                    // Fill the reading column instead of shrinking to the text.
-                    ui.set_min_width(ui.available_width());
-                    if kind.is_some() {
-                        if fold.is_some() {
-                            // The fold marker makes the heading a toggle; the
-                            // arrow shows the current collapsed/expanded state.
-                            let arrow = if open { "▼" } else { "▶" };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(format!("{arrow} {heading}"))
-                                            .font(bold_font(f * 0.92))
-                                            .color(active),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .corner_radius(CornerRadius::same(4)),
-                                )
-                                .clicked()
-                            {
-                                open = !open;
-                                ui.data_mut(|d| d.insert_temp(open_id, open));
-                            }
-                        } else {
-                            ui.label(
-                                RichText::new(heading)
-                                    .font(bold_font(f * 0.92))
-                                    .color(active),
-                            );
+            let inner = card_frame(Margin {
+                left: 18,
+                right: 16,
+                top: 12,
+                bottom: 12,
+            })
+            .stroke(Stroke::NONE)
+            .show(ui, |ui| {
+                // Fill the reading column instead of shrinking to the text.
+                ui.set_min_width(ui.available_width());
+                if kind.is_some() {
+                    if fold.is_some() {
+                        // The fold marker makes the heading a toggle; the
+                        // arrow shows the current collapsed/expanded state.
+                        if disclosure_button(ui, open, &heading, bold_font(f * 0.92), active) {
+                            open = !open;
+                            ui.data_mut(|d| d.insert_temp(open_id, open));
                         }
-                        if open {
-                            ui.add_space(4.0);
-                        }
-                    }
-                    if open {
-                        render_blocks(
-                            ui,
-                            blocks,
-                            f,
-                            depth,
-                            base_dir,
-                            image_click,
-                            math_cache,
-                            block_lines,
-                            hits,
+                    } else {
+                        ui.label(
+                            RichText::new(heading)
+                                .font(bold_font(f * 0.92))
+                                .color(active),
                         );
                     }
-                });
+                    if open {
+                        ui.add_space(4.0);
+                    }
+                }
+                if open {
+                    render_blocks(ui, blocks, f, base_dir, image_click, math_cache);
+                }
+            });
             // Left accent bar inside the frame.
             let r = inner.response.rect;
             let bar_h = (r.height() - 20.0).max(0.0);
@@ -3877,30 +3784,9 @@ fn render_block(
                             // block spacing; render them as a plain inline run
                             // so consecutive items sit on consecutive lines.
                             if *tight && let Block::Paragraph(inlines) = b {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    ui.spacing_mut().item_spacing.y = f * 0.35;
-                                    render_inlines(
-                                        ui,
-                                        inlines,
-                                        f,
-                                        base_dir,
-                                        image_click,
-                                        math_cache,
-                                    );
-                                });
+                                render_paragraph(ui, inlines, f, base_dir, image_click, math_cache);
                             } else {
-                                render_block(
-                                    ui,
-                                    b,
-                                    f,
-                                    depth,
-                                    base_dir,
-                                    image_click,
-                                    math_cache,
-                                    block_lines,
-                                    hits,
-                                );
+                                render_block(ui, b, f, base_dir, image_click, math_cache);
                             }
                         }
                     });
@@ -3946,8 +3832,9 @@ const TABLE_MIN_COL_W: f32 = 48.0;
 /// 4. sizes each row to the tallest wrapped cell.
 ///
 /// Inline markup inside cells is preserved through a [`LayoutJob`]
-/// (bold/italic/code/strikethrough/links/footnotes); images and formulas
-/// fall back to the widget-based inline renderer.
+/// (bold/italic/code/strikethrough/highlight/footnotes). Cells with links,
+/// images or formulas are laid out with the widget-based inline renderer
+/// instead, so the links stay clickable.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors render_block; each argument is a distinct rendering input"
@@ -4137,10 +4024,11 @@ fn render_table(
                     .layout(Layout::top_down(align)),
                 |ui| {
                     ui.set_max_width(inner_w);
-                    if cell.inlines.is_empty() || plain_text(&cell.inlines).trim().is_empty() {
+                    let needs_widgets = cell_needs_widgets(&cell.inlines);
+                    if !needs_widgets && plain_text(&cell.inlines).trim().is_empty() {
                         return;
                     }
-                    if cell_needs_widgets(&cell.inlines) {
+                    if needs_widgets {
                         // Widget-based fallback (images/formulas/links):
                         // an inline flow, left aligned.
                         ui.horizontal_wrapped(|ui| {
@@ -4222,7 +4110,7 @@ fn fit_table_columns(natural: &[f32], avail: f32) -> Vec<f32> {
         let denom = total.max(1.0);
         natural.iter().map(|w| w + extra * (w / denom)).collect()
     } else if avail <= min_total {
-        vec![(avail / n as f32).max(24.0); n]
+        vec![avail / n as f32; n]
     } else {
         // Water-filling: shrink only the widest columns. Narrow columns keep
         // their natural width, so short header words ("Default") are not
@@ -4438,33 +4326,18 @@ fn append_table_inlines(
                 s.background = palette().bg3;
                 s.push(job, c);
             }
-            Inline::Math { tex, .. } => style.push(job, tex),
-            Inline::Link { inlines, .. } => {
-                let mut s = style.clone();
-                s.color = palette().accent;
-                s.underline = Stroke::new(1.0, palette().accent);
-                append_table_inlines(job, inlines, &s);
-            }
+            // Images, formulas and links are rendered as widgets instead (see
+            // `cell_needs_widgets`), so they never reach this flattening.
+            Inline::Image { .. } | Inline::Math { .. } | Inline::Link { .. } => {}
             Inline::WikiLink { target, label } => {
-                let text = if label.trim().is_empty() {
-                    target
-                } else {
-                    label
-                };
                 let mut s = style.clone();
                 s.color = palette().accent;
                 s.underline = Stroke::new(1.0, palette().accent);
-                s.push(job, text);
+                s.push(job, non_empty_or(label, target));
             }
             Inline::WikiEmbed { target, label } => {
-                let text = if label.trim().is_empty() {
-                    target
-                } else {
-                    label
-                };
-                style.push(job, &format!("⧉ {text}"));
+                style.push(job, &format!("⧉ {}", non_empty_or(label, target)));
             }
-            Inline::Image { alt, .. } => style.push(job, alt),
             Inline::FootnoteRef { label, number } => {
                 let mut s = style.clone();
                 s.size = style.size * 0.75;
@@ -4503,16 +4376,12 @@ fn render_footnotes(
     base_dir: Option<&Path>,
     image_click: &mut Option<ImageRequest>,
     math_cache: &mut MathCache,
-    hits: &mut Vec<SourceHit>,
 ) {
     if doc.footnotes.is_empty() {
         return;
     }
     ui.add_space(f * 0.8);
-    let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, palette().stroke);
+    hairline(ui);
     ui.add_space(f * 0.5);
     ui.label(
         RichText::new("Footnotes")
@@ -4538,17 +4407,7 @@ fn render_footnotes(
             );
             ui.vertical(|ui| {
                 ui.label(RichText::new(label).size(f * 0.75).color(palette().faint));
-                render_blocks(
-                    ui,
-                    blocks,
-                    f * 0.92,
-                    1,
-                    base_dir,
-                    image_click,
-                    math_cache,
-                    &[],
-                    hits,
-                );
+                render_blocks(ui, blocks, f * 0.92, base_dir, image_click, math_cache);
             });
         });
         ui.add_space(f * 0.15);
@@ -4559,14 +4418,23 @@ fn render_footnotes(
 // Inline renderer
 // ---------------------------------------------------------------------------
 
+/// Case-insensitive prefix test that never splits a UTF-8 character.
+fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// True for `http://` and `https://` URLs.
+fn is_remote_url(url: &str) -> bool {
+    starts_with_ignore_case(url, "http://") || starts_with_ignore_case(url, "https://")
+}
+
 /// True for links that should be handed to the system browser.
 fn is_external_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("mailto:")
-        || lower.starts_with("tel:")
-        || lower.starts_with("data:")
+    is_remote_url(url)
+        || ["mailto:", "tel:", "data:"]
+            .iter()
+            .any(|scheme| starts_with_ignore_case(url, scheme))
 }
 
 /// Decodes `%20`-style escapes in local link paths.
@@ -4589,10 +4457,9 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolves a local Markdown link (`[x](note.md)`, `[[Note]]`) against the
-/// document folder. Returns `None` for external URLs, anchors and files that
-/// do not exist.
-fn resolve_link_target(url: &str, base_dir: Option<&Path>, wiki: bool) -> Option<PathBuf> {
+/// The file a local link points to, resolved against the document folder.
+/// `None` for external URLs, anchors and empty targets. The file need not exist.
+fn local_link_path(url: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
     if is_external_url(url) {
         return None;
     }
@@ -4601,20 +4468,28 @@ fn resolve_link_target(url: &str, base_dir: Option<&Path>, wiki: bool) -> Option
     if path.is_empty() {
         return None;
     }
-    let path = percent_decode(path);
     let base = base_dir.unwrap_or_else(|| Path::new("."));
-    let candidate = base.join(&path);
+    Some(base.join(percent_decode(path)))
+}
 
+/// Resolves a local Markdown link (`[x](note.md)`, `[[Note]]`) against the
+/// document folder. Returns `None` for external URLs, anchors and files that
+/// do not exist.
+fn resolve_link_target(url: &str, base_dir: Option<&Path>, wiki: bool) -> Option<PathBuf> {
+    let candidate = local_link_path(url, base_dir)?;
     if is_markdown(&candidate) && candidate.is_file() {
         return Some(candidate);
     }
     // Wiki-links (`[[Note]]`) and extension-less links name the note without
-    // its file extension.
+    // its file extension. The extension is appended, because `v1.2 notes` is
+    // a note name, not a file named `v1` with extension `2 notes`.
     if wiki || candidate.extension().is_none() {
-        for ext in ["md", "markdown", "mdown", "txt"] {
-            let candidate = candidate.with_extension(ext);
-            if candidate.is_file() {
-                return Some(candidate);
+        for ext in MARKDOWN_EXTENSIONS {
+            let mut name = candidate.clone().into_os_string();
+            name.push(format!(".{ext}"));
+            let with_ext = PathBuf::from(name);
+            if with_ext.is_file() {
+                return Some(with_ext);
             }
         }
     }
@@ -4626,14 +4501,15 @@ fn pending_open_id() -> egui::Id {
     egui::Id::unique("mdviewer_open_document")
 }
 
-/// Queues a local document to be opened in a tab after this frame.
+/// Queues a local file to be opened after this frame: Markdown in a tab,
+/// anything else in the system's default application.
 fn queue_open_document(ui: &Ui, path: PathBuf) {
     ui.ctx()
         .data_mut(|data| data.insert_temp(pending_open_id(), path));
 }
 
-/// Renders one inline link, opening local Markdown files in a tab and sending
-/// everything else to the system browser.
+/// Renders one inline link, opening local files and sending everything else
+/// to the system browser.
 fn render_link(
     ui: &mut Ui,
     label: &str,
@@ -4651,6 +4527,8 @@ fn render_link(
             queue_open_document(ui, path);
         } else if is_external_url(url) {
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        } else if let Some(path) = local_link_path(url, base_dir) {
+            queue_open_document(ui, path);
         }
     }
     response.on_hover_text(url);
@@ -4685,6 +4563,24 @@ mod bidi_tests {
         let visual = visual_inlines(&inlines);
         let text: String = visual.iter().map(|i| i.plain_text()).collect();
         assert_eq!(text, "مرحبا بالعالم\nHello مرحبا world 123 שלום");
+    }
+
+    #[test]
+    fn images_with_empty_alt_text_survive_reordering() {
+        let image = Inline::Image {
+            alt: String::new(),
+            url: "pic.png".into(),
+            title: None,
+            width: None,
+            height: None,
+        };
+        let inlines = vec![
+            Inline::Text("مرحبا ".into()),
+            image,
+            Inline::Text(" שלום".into()),
+        ];
+        let visual = visual_inlines(&inlines);
+        assert!(visual.iter().any(|i| matches!(i, Inline::Image { .. })));
     }
 
     #[test]
@@ -4758,6 +4654,28 @@ mod link_tests {
     }
 
     #[test]
+    fn wiki_links_keep_dots_in_note_names() {
+        let dir = temp_dir("dotted");
+        let note = dir.join("v1.2 release notes.md");
+        std::fs::write(&note, "# Notes\n").unwrap();
+        assert_eq!(
+            resolve_link_target("v1.2 release notes", Some(&dir), true),
+            Some(note)
+        );
+    }
+
+    #[test]
+    fn local_files_resolve_without_being_markdown() {
+        let dir = temp_dir("pdf");
+        assert_eq!(
+            local_link_path("spec%20sheet.pdf#page2", Some(&dir)),
+            Some(dir.join("spec sheet.pdf"))
+        );
+        assert_eq!(resolve_link_target("spec.pdf", Some(&dir), false), None);
+        assert_eq!(local_link_path("#section", Some(&dir)), None);
+    }
+
+    #[test]
     fn standalone_wiki_embed_resolves_for_block_transclusion() {
         let dir = temp_dir("transclude");
         let note = dir.join("Note.md");
@@ -4810,14 +4728,6 @@ fn flatten_bidi(inlines: &[Inline], out: &mut Vec<BidiLeaf>) {
                 inline: inline.clone(),
                 text: text.clone(),
             }),
-            Inline::Emph(v) => wrap_bidi(v, out, |i| Inline::Emph(vec![i])),
-            Inline::Strong(v) => wrap_bidi(v, out, |i| Inline::Strong(vec![i])),
-            Inline::Strike(v) => wrap_bidi(v, out, |i| Inline::Strike(vec![i])),
-            Inline::Highlight(v) => wrap_bidi(v, out, |i| Inline::Highlight(vec![i])),
-            Inline::Underline(v) => wrap_bidi(v, out, |i| Inline::Underline(vec![i])),
-            Inline::Kbd(v) => wrap_bidi(v, out, |i| Inline::Kbd(vec![i])),
-            Inline::Super(v) => wrap_bidi(v, out, |i| Inline::Super(vec![i])),
-            Inline::Sub(v) => wrap_bidi(v, out, |i| Inline::Sub(vec![i])),
             Inline::Link { inlines, url } => {
                 let start = out.len();
                 flatten_bidi(inlines, out);
@@ -4828,21 +4738,55 @@ fn flatten_bidi(inlines: &[Inline], out: &mut Vec<BidiLeaf>) {
                     };
                 }
             }
-            // Atomic elements: keep them as one unit. U+FFFC (object
-            // replacement character) participates as neutral in bidi.
-            _ => out.push(BidiLeaf {
-                inline: inline.clone(),
-                text: "\u{FFFC}".into(),
-            }),
+            _ => match styled_children(inline) {
+                Some((children, wrap)) => wrap_bidi(children, out, wrap),
+                // Atomic elements: keep them as one unit. U+FFFC (object
+                // replacement character) participates as neutral in bidi.
+                None => out.push(BidiLeaf {
+                    inline: inline.clone(),
+                    text: "\u{FFFC}".into(),
+                }),
+            },
         }
     }
 }
 
-fn wrap_bidi(inlines: &[Inline], out: &mut Vec<BidiLeaf>, wrap: impl Fn(Inline) -> Inline) {
+/// Rebuilds a style-only inline around its children.
+type InlineWrap = fn(Vec<Inline>) -> Inline;
+
+/// Children and rebuilding constructor of a style-only inline (emphasis,
+/// strikethrough, sub/superscript, …). `None` for every other inline.
+fn styled_children(inline: &Inline) -> Option<(&[Inline], InlineWrap)> {
+    let wrap: InlineWrap = match inline {
+        Inline::Emph(_) => Inline::Emph,
+        Inline::Strong(_) => Inline::Strong,
+        Inline::Strike(_) => Inline::Strike,
+        Inline::Highlight(_) => Inline::Highlight,
+        Inline::Underline(_) => Inline::Underline,
+        Inline::Kbd(_) => Inline::Kbd,
+        Inline::Super(_) => Inline::Super,
+        Inline::Sub(_) => Inline::Sub,
+        _ => return None,
+    };
+    match inline {
+        Inline::Emph(v)
+        | Inline::Strong(v)
+        | Inline::Strike(v)
+        | Inline::Highlight(v)
+        | Inline::Underline(v)
+        | Inline::Kbd(v)
+        | Inline::Super(v)
+        | Inline::Sub(v) => Some((v.as_slice(), wrap)),
+        _ => None,
+    }
+}
+
+/// Flattens `inlines` into `out`, wrapping every produced leaf with `wrap`.
+fn wrap_bidi(inlines: &[Inline], out: &mut Vec<BidiLeaf>, wrap: InlineWrap) {
     let start = out.len();
     flatten_bidi(inlines, out);
     for leaf in &mut out[start..] {
-        leaf.inline = wrap(leaf.inline.clone());
+        leaf.inline = wrap(vec![leaf.inline.clone()]);
     }
 }
 
@@ -4971,7 +4915,8 @@ fn visual_inlines_line(inlines: &[Inline]) -> std::borrow::Cow<'_, [Inline]> {
     let mut out: Vec<Inline> = Vec::new();
     for (inline, _) in segments {
         let inline = trim_visual_inline(inline);
-        if inline.plain_text().trim().is_empty() {
+        // Only blank text is dropped; an image with empty alt text is kept.
+        if matches!(&inline, Inline::Text(text) if text.trim().is_empty()) {
             continue;
         }
         if let Some(previous) = out.last()
@@ -5195,42 +5140,45 @@ fn inline_text_format(f: f32, st: InlineStyle) -> TextFormat {
 }
 
 thread_local! {
-    /// Lower-cased find query used to paint matches in the preview.
+    /// Find query used to paint matches in the preview, as the user typed it.
     static PREVIEW_FIND: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Sets (or clears) the find query used by the preview renderer.
+/// Sets (or clears) the find query used by the preview renderer. Matching is
+/// ASCII case-insensitive.
 fn set_preview_find(query: Option<String>) {
     PREVIEW_FIND.with(|slot| *slot.borrow_mut() = query);
 }
 
 /// Appends text, painting occurrences of the active find query.
 fn append_text_highlighted(job: &mut egui::text::LayoutJob, text: &str, f: f32, st: InlineStyle) {
-    let query = PREVIEW_FIND.with(|slot| slot.borrow().clone());
-    let Some(query) = query.filter(|q| !q.is_empty()) else {
-        if !text.is_empty() {
-            job.append(text, 0.0, inline_text_format(f, st));
+    PREVIEW_FIND.with(|slot| {
+        let query = slot.borrow();
+        let Some(query) = query.as_deref().filter(|q| !q.is_empty()) else {
+            if !text.is_empty() {
+                job.append(text, 0.0, inline_text_format(f, st));
+            }
+            return;
+        };
+        let hay = text.to_ascii_lowercase();
+        let needle = query.to_ascii_lowercase();
+        let mut start = 0usize;
+        while let Some(pos) = hay[start..].find(&needle) {
+            let begin = start + pos;
+            if begin > start {
+                job.append(&text[start..begin], 0.0, inline_text_format(f, st));
+            }
+            let mut format = inline_text_format(f, st);
+            format.background = palette().highlight_bg;
+            format.color = palette().highlight_text;
+            job.append(&text[begin..begin + needle.len()], 0.0, format);
+            start = begin + needle.len();
         }
-        return;
-    };
-    let hay = text.to_ascii_lowercase();
-    let needle = query.to_ascii_lowercase();
-    let mut start = 0usize;
-    while let Some(pos) = hay[start..].find(&needle) {
-        let begin = start + pos;
-        if begin > start {
-            job.append(&text[start..begin], 0.0, inline_text_format(f, st));
+        if start < text.len() {
+            job.append(&text[start..], 0.0, inline_text_format(f, st));
         }
-        let mut format = inline_text_format(f, st);
-        format.background = palette().highlight_bg;
-        format.color = palette().highlight_text;
-        job.append(&text[begin..begin + needle.len()], 0.0, format);
-        start = begin + needle.len();
-    }
-    if start < text.len() {
-        job.append(&text[start..], 0.0, inline_text_format(f, st));
-    }
+    });
 }
 
 /// Appends text-like inlines to a layout job, carrying nested styles.
@@ -5423,34 +5371,16 @@ fn render_inlines_styled(
             }
             Inline::Link { inlines, url } => {
                 let label = plain_text(inlines);
-                let label = if label.trim().is_empty() {
-                    url.clone()
-                } else {
-                    label
-                };
-                render_link(ui, &label, url, f, st, line_h, base_dir);
+                render_link(ui, non_empty_or(&label, url), url, f, st, line_h, base_dir);
             }
             Inline::WikiLink { target, label } => {
-                let text = if label.trim().is_empty() {
-                    target
-                } else {
-                    label
-                };
                 let mut s = st;
                 s.color = Some(palette().accent);
                 s.underline = true;
-                let resp = ui.add(
-                    Label::new(styled_inline_text(text, f, s, line_h)).sense(egui::Sense::click()),
-                );
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if resp.clicked()
-                    && let Some(path) = resolve_link_target(target, base_dir, true)
-                {
-                    queue_open_document(ui, path);
-                }
-                resp.on_hover_text(format!("Obsidian wiki-link: {target}"));
+                let text = styled_inline_text(non_empty_or(label, target), f, s, line_h);
+                let resp = ui.add(Label::new(text).sense(egui::Sense::click()));
+                wiki_target_response(ui, resp, target, base_dir)
+                    .on_hover_text(format!("Obsidian wiki-link: {target}"));
             }
             Inline::Image {
                 alt,
@@ -5472,11 +5402,7 @@ fn render_inlines_styled(
                 );
             }
             Inline::WikiEmbed { target, label } => {
-                let text = if label.trim().is_empty() {
-                    target
-                } else {
-                    label
-                };
+                let text = non_empty_or(label, target);
                 let response = Frame::new()
                     .fill(palette().bg2)
                     .corner_radius(CornerRadius::same(6))
@@ -5504,15 +5430,8 @@ fn render_inlines_styled(
                     ui.scope_id().with("wiki_embed"),
                     egui::Sense::click(),
                 );
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if response.clicked()
-                    && let Some(path) = resolve_link_target(target, base_dir, true)
-                {
-                    queue_open_document(ui, path);
-                }
-                response.on_hover_text(format!("Obsidian embed: {target}"));
+                wiki_target_response(ui, response, target, base_dir)
+                    .on_hover_text(format!("Obsidian embed: {target}"));
             }
             Inline::Tag(tag) => {
                 Frame::new()
@@ -5571,7 +5490,8 @@ fn render_inlines_styled(
 /// and VPN settings, and avoids the whole socket/timeout code path.
 ///
 /// Results are cached per URI and fetched on a background thread so the UI
-/// thread never blocks.
+/// thread never blocks. A failed download is retried after
+/// [`REMOTE_RETRY_AFTER`], and at most [`MAX_CONCURRENT_FETCHES`] run at once.
 #[derive(Default)]
 struct CurlBytesLoader {
     cache: Arc<Mutex<HashMap<String, CurlEntry>>>,
@@ -5580,7 +5500,8 @@ struct CurlBytesLoader {
 #[derive(Clone)]
 enum CurlEntry {
     Pending,
-    Ready(Result<CachedBytes, String>),
+    Ready(CachedBytes),
+    Failed { error: String, at: Instant },
 }
 
 #[derive(Clone)]
@@ -5589,13 +5510,20 @@ struct CachedBytes {
     mime: Option<String>,
 }
 
+/// Downloads running at once. Further images wait and are requested again on
+/// the next frame, so a page with many images does not start many `curl`s.
+const MAX_CONCURRENT_FETCHES: usize = 4;
+/// A failed download is retried once it is this old.
+const REMOTE_RETRY_AFTER: Duration = Duration::from_secs(30);
+static ACTIVE_FETCHES: AtomicUsize = AtomicUsize::new(0);
+
 impl BytesLoader for CurlBytesLoader {
     fn id(&self) -> &str {
         "md_viewer::ui::CurlBytesLoader"
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str) -> BytesLoadResult {
-        if !(uri.starts_with("http://") || uri.starts_with("https://")) {
+        if !is_remote_url(uri) {
             return Err(LoadError::NotSupported);
         }
 
@@ -5606,13 +5534,19 @@ impl BytesLoader for CurlBytesLoader {
             .and_then(|cache| cache.get(uri).cloned());
         match cached {
             Some(CurlEntry::Pending) => Ok(BytesPoll::Pending { size: None }),
-            Some(CurlEntry::Ready(Ok(bytes))) => Ok(BytesPoll::Ready {
+            Some(CurlEntry::Ready(bytes)) => Ok(BytesPoll::Ready {
                 size: None,
                 bytes: Bytes::Shared(bytes.data),
                 mime: bytes.mime,
             }),
-            Some(CurlEntry::Ready(Err(err))) => Err(LoadError::Loading(err)),
-            None => {
+            Some(CurlEntry::Failed { error, at }) if at.elapsed() < REMOTE_RETRY_AFTER => {
+                Err(LoadError::Loading(error))
+            }
+            _ => {
+                if ACTIVE_FETCHES.load(Ordering::Relaxed) >= MAX_CONCURRENT_FETCHES {
+                    return Ok(BytesPoll::Pending { size: None });
+                }
+                ACTIVE_FETCHES.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.insert(uri.to_owned(), CurlEntry::Pending);
                 }
@@ -5621,8 +5555,16 @@ impl BytesLoader for CurlBytesLoader {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
                     let result = fetch_with_curl(&url);
+                    ACTIVE_FETCHES.fetch_sub(1, Ordering::Relaxed);
                     if let Ok(mut cache) = cache.lock() {
-                        cache.insert(url, CurlEntry::Ready(result));
+                        let entry = match result {
+                            Ok(bytes) => CurlEntry::Ready(bytes),
+                            Err(error) => CurlEntry::Failed {
+                                error,
+                                at: Instant::now(),
+                            },
+                        };
+                        cache.insert(url, entry);
                     }
                     ctx.request_repaint();
                 });
@@ -5650,7 +5592,7 @@ impl BytesLoader for CurlBytesLoader {
                 cache
                     .values()
                     .filter_map(|entry| match entry {
-                        CurlEntry::Ready(Ok(bytes)) => Some(bytes.data.len()),
+                        CurlEntry::Ready(bytes) => Some(bytes.data.len()),
                         _ => None,
                     })
                     .sum()
@@ -5672,6 +5614,7 @@ impl BytesLoader for CurlBytesLoader {
 
 /// Downloads one URL with `/usr/bin/curl` (always present on macOS).
 fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
+    let max_bytes = MAX_REMOTE_BYTES.to_string();
     let output = std::process::Command::new("/usr/bin/curl")
         .args([
             "--fail",
@@ -5688,7 +5631,7 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
             "--proto-redir",
             "=https,http",
             "--max-filesize",
-            "26214400",
+            max_bytes.as_str(),
             "--",
         ])
         .arg(url)
@@ -5704,13 +5647,31 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
             format!("curl: {detail}")
         });
     }
-    if output.stdout.len() > MAX_REMOTE_BYTES {
+    check_download_limits(&output.stdout)?;
+    let data: Arc<[u8]> = output.stdout.into();
+    let mime = sniff_mime(&data).map(str::to_owned);
+    Ok(CachedBytes { data, mime })
+}
+
+/// Maximum bytes accepted from a remote image download or data URI.
+const MAX_REMOTE_BYTES: usize = 25 * 1024 * 1024;
+
+/// Maximum width or height of a remote raster image or SVG.
+const MAX_REMOTE_DIMENSION: u32 = 12_000;
+
+/// Maximum pixel count of a remote raster image (~40 MP).
+const MAX_REMOTE_PIXELS: u64 = 40_000_000;
+
+/// Rejects image bytes that are too large to load safely: the byte size, and
+/// the pixel size of raster images. SVG sizes are checked by [`svg_size_error`].
+fn check_download_limits(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_REMOTE_BYTES {
         return Err(format!(
             "image is larger than {} MB",
             MAX_REMOTE_BYTES / (1024 * 1024)
         ));
     }
-    if let Some((width, height)) = raster_dimensions(&output.stdout)
+    if let Some((width, height)) = raster_dimensions(bytes)
         && (width > MAX_REMOTE_DIMENSION
             || height > MAX_REMOTE_DIMENSION
             || u64::from(width) * u64::from(height) > MAX_REMOTE_PIXELS)
@@ -5722,23 +5683,27 @@ fn fetch_with_curl(url: &str) -> Result<CachedBytes, String> {
             MAX_REMOTE_PIXELS / 1_000_000
         ));
     }
-    let data: Arc<[u8]> = output.stdout.into();
-    let mime = sniff_mime(&data).map(str::to_owned);
-    Ok(CachedBytes { data, mime })
+    Ok(())
 }
 
-/// Maximum bytes accepted from a remote image download.
-const MAX_REMOTE_BYTES: usize = 25 * 1024 * 1024;
-
-/// Maximum width or height of a remote raster image.
-const MAX_REMOTE_DIMENSION: u32 = 12_000;
-
-/// Maximum pixel count of a remote raster image (~40 MP).
-const MAX_REMOTE_PIXELS: u64 = 40_000_000;
+/// Error message if an SVG's natural size exceeds [`MAX_REMOTE_DIMENSION`].
+/// Documents that do not parse return `None`; the renderer reports those.
+fn svg_size_error(bytes: &[u8]) -> Option<String> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &crate::svg::options()).ok()?;
+    let size = tree.size();
+    let limit = MAX_REMOTE_DIMENSION as f32;
+    (size.width() > limit || size.height() > limit).then(|| {
+        format!(
+            "SVG is too large ({:.0}×{:.0} px); the limit is {MAX_REMOTE_DIMENSION} px per side",
+            size.width(),
+            size.height()
+        )
+    })
+}
 
 /// Reads the intrinsic dimensions of a raster image without decoding pixels.
 ///
-/// SVG payloads are skipped: they are rasterized with a capped scale instead.
+/// SVG payloads are skipped; [`svg_size_error`] checks them instead.
 fn raster_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if looks_like_svg(bytes) {
         return None;
@@ -5751,18 +5716,12 @@ fn raster_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 /// Best-effort content type from the downloaded bytes.
 fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else if looks_like_svg(bytes) {
+    if looks_like_svg(bytes) {
         Some("image/svg+xml")
     } else {
-        None
+        image::guess_format(bytes)
+            .ok()
+            .map(|format| format.to_mime_type())
     }
 }
 
@@ -5774,8 +5733,10 @@ type SvgCache = Mutex<HashMap<(String, SizeHint), Result<Arc<egui::ColorImage>, 
 /// The stock [`egui_extras`] SVG loader decides support from the URI extension
 /// only. Services commonly serve SVG with a generic URL, which made README
 /// badges fall through to the raster decoder and disappear behind an error
-/// placeholder. This loader fetches the already-cached bytes, checks the MIME
-/// type / XML payload, and rasterizes with the same `resvg` backend.
+/// placeholder. This loader takes the bytes from egui's bytes loader (which
+/// may start a download), checks the MIME type or XML payload, rejects SVGs
+/// whose natural size exceeds [`MAX_REMOTE_DIMENSION`], and rasterizes with
+/// the same `resvg` backend.
 #[derive(Default)]
 struct SvgSniffLoader {
     cache: SvgCache,
@@ -5787,8 +5748,7 @@ impl ImageLoader for SvgSniffLoader {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str, size_hint: SizeHint) -> ImageLoadResult {
-        let remote = uri.starts_with("http://") || uri.starts_with("https://");
-        if !remote || egui::load::has_extension(uri, "svg") {
+        if !is_remote_url(uri) || egui::load::has_extension(uri, "svg") {
             // Explicit `.svg` URIs are handled by egui_extras' SvgLoader.
             return Err(LoadError::NotSupported);
         }
@@ -5811,11 +5771,15 @@ impl ImageLoader for SvgSniffLoader {
                     return Err(LoadError::NotSupported);
                 }
 
-                let mut options = resvg::usvg::Options::default();
-                options.fontdb_mut().load_system_fonts();
-                let result =
-                    egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, &options)
-                        .map(Arc::new);
+                let result: Result<Arc<egui::ColorImage>, String> = match svg_size_error(&bytes) {
+                    Some(error) => Err(error),
+                    None => egui_extras::image::load_svg_bytes_with_size(
+                        &bytes,
+                        size_hint,
+                        &crate::svg::options(),
+                    )
+                    .map(Arc::new),
+                };
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.insert(key, result.clone());
                 }
@@ -5855,15 +5819,18 @@ impl ImageLoader for SvgSniffLoader {
     }
 }
 
-/// True if a downloaded payload looks like an SVG document.
+/// True if a downloaded payload looks like an SVG document. A UTF-8 byte order
+/// mark, whitespace and an XML or DOCTYPE prolog are allowed before `<svg`.
 fn looks_like_svg(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let start = bytes
         .iter()
         .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(0);
-    let sniff = &bytes[start..bytes.len().min(start + 512)];
+        .unwrap_or(bytes.len());
+    let sniff = &bytes[start..bytes.len().min(start + 4096)];
     let text = String::from_utf8_lossy(sniff).to_ascii_lowercase();
-    text.starts_with("<svg") || (text.starts_with("<?xml") && text.contains("<svg"))
+    text.starts_with("<svg")
+        || ((text.starts_with("<?xml") || text.starts_with("<!doctype")) && text.contains("<svg"))
 }
 
 /// Starts a new wrapped row if an image of `desired_w` does not fit into the
@@ -6029,36 +5996,32 @@ fn render_image(
 
 /// Draws a framed placeholder for an image that cannot be resolved.
 fn image_placeholder(ui: &mut Ui, alt: &str, url: &str, reason: &str, f: f32) {
-    Frame::new()
-        .fill(palette().bg2)
-        .corner_radius(CornerRadius::same(8))
-        .stroke(Stroke::new(1.0, palette().stroke))
-        .inner_margin(Margin {
-            left: 14,
-            right: 14,
-            top: 10,
-            bottom: 10,
-        })
-        .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.label(RichText::new("🖼").size(f * 1.3).color(palette().faint));
-                ui.vertical(|ui| {
-                    let name = if alt.trim().is_empty() { "Image" } else { alt };
-                    ui.label(
-                        RichText::new(name)
-                            .font(bold_font(f * 0.9))
-                            .color(palette().text),
-                    );
-                    ui.label(
-                        RichText::new(url)
-                            .monospace()
-                            .size(f * 0.72)
-                            .color(palette().faint),
-                    );
-                    ui.label(RichText::new(reason).size(f * 0.72).color(palette().muted));
-                });
+    card_frame(Margin {
+        left: 14,
+        right: 14,
+        top: 10,
+        bottom: 10,
+    })
+    .show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            ui.label(RichText::new("🖼").size(f * 1.3).color(palette().faint));
+            ui.vertical(|ui| {
+                let name = if alt.trim().is_empty() { "Image" } else { alt };
+                ui.label(
+                    RichText::new(name)
+                        .font(bold_font(f * 0.9))
+                        .color(palette().text),
+                );
+                ui.label(
+                    RichText::new(url)
+                        .monospace()
+                        .size(f * 0.72)
+                        .color(palette().faint),
+                );
+                ui.label(RichText::new(reason).size(f * 0.72).color(palette().muted));
             });
         });
+    });
 }
 
 /// Renders the front-matter properties at the top of the preview.
@@ -6066,55 +6029,49 @@ fn render_front_matter(ui: &mut Ui, doc: &Document, f: f32) {
     if doc.metadata.is_empty() {
         return;
     }
-    Frame::new()
-        .fill(palette().bg2)
-        .corner_radius(CornerRadius::same(8))
-        .stroke(Stroke::new(1.0, palette().stroke))
-        .inner_margin(Margin {
-            left: 14,
-            right: 14,
-            top: 10,
-            bottom: 10,
-        })
-        .show(ui, |ui| {
-            let full = ui.available_width();
-            ui.set_min_width(full);
-            ui.set_max_width(full);
-            ui.label(
-                RichText::new("Properties")
-                    .font(bold_font(f * 0.72))
-                    .color(palette().faint),
-            );
-            ui.add_space(4.0);
-            // A Grid uses non-wrapping labels and can widen the whole reading
-            // column when a front-matter value is long (e.g. `purpose`). Use
-            // wrapping labels instead so the properties never push the text
-            // under the right window edge.
-            let key_w = (f * 6.2).clamp(64.0, 118.0);
-            for (k, v) in &doc.metadata {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(key_w, 0.0),
-                        Layout::left_to_right(Align::TOP),
-                        |ui| {
-                            ui.set_max_width(key_w);
-                            ui.add(
-                                Label::new(
-                                    RichText::new(k)
-                                        .font(bold_font(f * 0.78))
-                                        .color(palette().muted),
-                                )
-                                .wrap(),
-                            );
-                        },
-                    );
-                    ui.add(
-                        Label::new(RichText::new(v).size(f * 0.82).color(palette().text)).wrap(),
-                    );
-                });
-            }
-        });
+    card_frame(Margin {
+        left: 14,
+        right: 14,
+        top: 10,
+        bottom: 10,
+    })
+    .show(ui, |ui| {
+        let full = ui.available_width();
+        ui.set_min_width(full);
+        ui.set_max_width(full);
+        ui.label(
+            RichText::new("Properties")
+                .font(bold_font(f * 0.72))
+                .color(palette().faint),
+        );
+        ui.add_space(4.0);
+        // A Grid uses non-wrapping labels and can widen the whole reading
+        // column when a front-matter value is long (e.g. `purpose`). Use
+        // wrapping labels instead so the properties never push the text
+        // under the right window edge.
+        let key_w = (f * 6.2).clamp(64.0, 118.0);
+        for (k, v) in &doc.metadata {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(key_w, 0.0),
+                    Layout::left_to_right(Align::TOP),
+                    |ui| {
+                        ui.set_max_width(key_w);
+                        ui.add(
+                            Label::new(
+                                RichText::new(k)
+                                    .font(bold_font(f * 0.78))
+                                    .color(palette().muted),
+                            )
+                            .wrap(),
+                        );
+                    },
+                );
+                ui.add(Label::new(RichText::new(v).size(f * 0.82).color(palette().text)).wrap());
+            });
+        }
+    });
     ui.add_space(f * 0.7);
 }
 
@@ -6222,42 +6179,37 @@ fn render_mermaid(ui: &mut Ui, src: &str, f: f32) {
         return;
     };
     ui.add_space(f * 0.35);
-    Frame::new()
-        .fill(palette().bg2)
-        .corner_radius(CornerRadius::same(8))
-        .stroke(Stroke::new(1.0, palette().stroke))
-        .inner_margin(Margin {
-            left: 12,
-            right: 12,
-            top: 10,
-            bottom: 10,
-        })
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            let avail = (ui.available_width() - 4.0).max(32.0);
-            let scale = (avail / tex.size.x).min(1.0);
-            let size = tex.size * scale;
-            ui.vertical_centered(|ui| {
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(tex.handle.id(), tex.size))
-                        .fit_to_exact_size(size)
-                        .sense(egui::Sense::hover()),
-                )
-                .on_hover_text("Mermaid diagram (native Rust renderer, dark theme)");
-            });
+    card_frame(Margin {
+        left: 12,
+        right: 12,
+        top: 10,
+        bottom: 10,
+    })
+    .show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        let avail = (ui.available_width() - 4.0).max(32.0);
+        let scale = (avail / tex.size.x).min(1.0);
+        let size = tex.size * scale;
+        ui.vertical_centered(|ui| {
+            ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(tex.handle.id(), tex.size))
+                    .fit_to_exact_size(size)
+                    .sense(egui::Sense::hover()),
+            )
+            .on_hover_text("Mermaid diagram (rendered natively)");
         });
+    });
     ui.add_space(f * 0.55);
 }
 
+/// Mermaid textures kept in egui memory. Edits in split view add a texture
+/// per changed diagram, so the cache is cleared once it reaches this size.
+const MERMAID_CACHE_LIMIT: usize = 32;
+
 /// Returns (and caches) the rasterized texture for a Mermaid source.
 fn mermaid_texture(ctx: &egui::Context, src: &str) -> Option<MermaidTexture> {
-    use std::hash::{Hash as _, Hasher as _};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // Theme is part of the key: Paper diagrams use a light palette.
-    (theme::mode() as u8).hash(&mut hasher);
-    src.hash(&mut hasher);
-    let key = hasher.finish();
+    let key = hash_key((theme::mode() as u8, src));
     let cache_id = egui::Id::unique("mdviewer_mermaid_cache");
 
     if let Some(hit) = ctx.data_mut(|d| {
@@ -6271,51 +6223,33 @@ fn mermaid_texture(ctx: &egui::Context, src: &str) -> Option<MermaidTexture> {
 
     let rendered = rasterize_mermaid(ctx, src);
     ctx.data_mut(|d| {
-        d.get_temp_mut_or_default::<MermaidCache>(cache_id)
-            .entries
-            .insert(key, rendered.clone());
+        let cache = d.get_temp_mut_or_default::<MermaidCache>(cache_id);
+        if cache.entries.len() >= MERMAID_CACHE_LIMIT {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, rendered.clone());
     });
     rendered
 }
 
-/// Runs the pure-Rust Mermaid renderer and rasterizes its SVG with resvg.
+/// Runs the pure-Rust Mermaid renderer and rasterizes its SVG. The bitmap is
+/// bounded on its longer side, so a huge Gantt diagram cannot allocate a
+/// gigantic texture.
 fn rasterize_mermaid(ctx: &egui::Context, src: &str) -> Option<MermaidTexture> {
-    use std::hash::{Hash as _, Hasher as _};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    src.hash(&mut hasher);
-    let key = hasher.finish();
-
     let svg = mermaid_svg::render_with(src, &mermaid_theme()).ok()?;
-    let mut opt = resvg::usvg::Options::default();
-    opt.fontdb_mut().load_system_fonts();
-    let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
-    let natural = tree.size();
-    if natural.width() <= 0.0 || natural.height() <= 0.0 {
-        return None;
-    }
-    let ppp = ctx.pixels_per_point();
-    // Crisp on Retina, but bounded so a huge Gantt diagram cannot allocate a
-    // gigantic texture.
-    let scale = (ppp * 1.2).min(2048.0 / natural.width().max(1.0));
-    let w = (natural.width() * scale).ceil().max(1.0) as u32;
-    let h = (natural.height() * scale).ceil().max(1.0) as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
+    // Crisp on Retina.
+    let raster = crate::svg::rasterize(&svg, ctx.pixels_per_point() * 1.2, 2048.0)?;
+    let (w, h) = (raster.pixmap.width(), raster.pixmap.height());
     let color_image =
-        egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data());
+        egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], raster.pixmap.data());
     let handle = ctx.load_texture(
-        format!("mermaid:{key}:{w}x{h}"),
+        format!("mermaid:{}:{w}x{h}", hash_key(src)),
         color_image,
         egui::TextureOptions::LINEAR,
     );
     Some(MermaidTexture {
         handle,
-        size: Vec2::new(natural.width(), natural.height()),
+        size: Vec2::new(raster.width, raster.height),
     })
 }
 
@@ -6325,22 +6259,27 @@ fn rasterize_mermaid(ctx: &egui::Context, src: &str) -> Option<MermaidTexture> {
 /// root-relative paths (`/assets/…`) are joined with `base_dir` (the folder
 /// that contains the Markdown file) and converted to a `file://` URI.
 fn resolve_uri(url: &str, base_dir: Option<&Path>) -> String {
-    let remote = url.starts_with("http://") || url.starts_with("https://");
-    if remote || url.starts_with("file://") || url.starts_with("data:") {
+    if is_remote_url(url) || url.starts_with("file://") || url.starts_with("data:") {
         return url.to_string();
     }
-    let path = match base_dir {
+    file_uri(&resolve_local_path(url, base_dir))
+}
+
+/// Local path of an image or link URL. Root-relative paths (`/assets/…`) are
+/// relative to `base_dir`, not to the file system root.
+fn resolve_local_path(url: &str, base_dir: Option<&Path>) -> PathBuf {
+    match base_dir {
         Some(dir) if url.starts_with('/') && !url.starts_with("//") => {
             dir.join(url.trim_start_matches('/'))
         }
         Some(dir) if !Path::new(url).is_absolute() => dir.join(url),
         _ => PathBuf::from(url),
-    };
-    format!("file://{}", path.display())
+    }
 }
 
 /// Decodes a base64 `data:` URI into a cached temporary file so the regular
 /// file image loader can use it (egui_extras does not load data URIs directly).
+/// Returns `None` if the payload is too large or is not a valid image.
 fn data_uri_to_temp_file(uri: &str) -> Option<String> {
     let data = uri.strip_prefix("data:")?;
     let (meta, payload) = data.split_once(',')?;
@@ -6357,15 +6296,16 @@ fn data_uri_to_temp_file(uri: &str) -> Option<String> {
         otherwise => otherwise.rsplit('/').next().unwrap_or("bin"),
     };
     let bytes = base64_decode(payload)?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash as _, Hasher as _};
-    bytes.hash(&mut hasher);
+    check_download_limits(&bytes).ok()?;
+    if extension == "svg" && svg_size_error(&bytes).is_some() {
+        return None;
+    }
     let path =
-        std::env::temp_dir().join(format!("mdviewer-data-{:x}.{extension}", hasher.finish()));
+        std::env::temp_dir().join(format!("mdviewer-data-{:x}.{extension}", hash_key(&bytes)));
     if !path.exists() {
         std::fs::write(&path, &bytes).ok()?;
     }
-    Some(format!("file://{}", path.display()))
+    Some(file_uri(&path))
 }
 
 fn base64_decode(value: &str) -> Option<Vec<u8>> {
@@ -6402,68 +6342,109 @@ fn base64_decode(value: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// AVIF files whose `sips` conversion failed. They are not retried on every
+/// frame; the entry is keyed by the output path, which changes with the file's
+/// modification time.
+static FAILED_AVIF: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
 /// macOS `sips` can decode AVIF (the pure-Rust image stack cannot without a
-/// heavy native decoder). Convert once to a cached PNG next to the temp dir.
+/// heavy native decoder). Convert once to a cached PNG in the temp dir; a
+/// failed conversion is not retried for the rest of the session.
 fn convert_avif_preview(url: &str, base_dir: Option<&Path>) -> Option<String> {
     if !url.to_ascii_lowercase().ends_with(".avif") {
         return None;
     }
-    let base = base_dir?;
-    let path = base.join(url);
+    let path = resolve_local_path(url, Some(base_dir?));
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash as _, Hasher as _};
-    path.hash(&mut hasher);
-    modified.hash(&mut hasher);
-    let out = std::env::temp_dir().join(format!("mdviewer-avif-{:x}.png", hasher.finish()));
-    if !out.exists() {
-        let status = std::process::Command::new("/usr/bin/sips")
-            .args(["-s", "format", "png"])
-            .arg(&path)
-            .arg("--out")
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
+    let out = std::env::temp_dir().join(format!(
+        "mdviewer-avif-{:x}.png",
+        hash_key((&path, modified))
+    ));
+    if out.exists() {
+        return Some(file_uri(&out));
     }
-    Some(format!("file://{}", out.display()))
+    if FAILED_AVIF.lock().is_ok_and(|failed| failed.contains(&out)) {
+        return None;
+    }
+    let converted = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png"])
+        .arg(&path)
+        .arg("--out")
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !converted {
+        if let Ok(mut failed) = FAILED_AVIF.lock() {
+            failed.insert(out);
+        }
+        return None;
+    }
+    Some(file_uri(&out))
+}
+
+/// Syntax-highlighted code blocks, keyed by code, font size and theme. Laying
+/// out the highlight is the expensive part of a code block, so it is reused.
+#[derive(Clone, Default)]
+struct HighlightCache {
+    entries: HashMap<u64, egui::text::LayoutJob>,
+}
+
+/// Highlighted code blocks kept in egui memory before the cache is cleared.
+const HIGHLIGHT_CACHE_LIMIT: usize = 64;
+
+/// Returns the highlighted job for a code block, reusing the cached one while
+/// the code, font size and theme are unchanged.
+fn highlighted_code(ctx: &egui::Context, code: &str, f: f32) -> egui::text::LayoutJob {
+    let key = hash_key((code, f.to_bits(), theme::mode() as u8));
+    let cache_id = egui::Id::unique("mdviewer_highlight_cache");
+    if let Some(job) = ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<HighlightCache>(cache_id)
+            .entries
+            .get(&key)
+            .cloned()
+    }) {
+        return job;
+    }
+    let job = highlight(code, FontId::monospace(f * 0.88));
+    ctx.data_mut(|d| {
+        let cache = d.get_temp_mut_or_default::<HighlightCache>(cache_id);
+        if cache.entries.len() >= HIGHLIGHT_CACHE_LIMIT {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, job.clone());
+    });
+    job
 }
 
 /// Renders a code block with a language label and horizontal scrolling.
 fn render_code(ui: &mut Ui, lang: Option<&str>, code: &str, f: f32) {
     ui.add_space(f * 0.25);
-    Frame::new()
-        .fill(palette().bg2)
-        .corner_radius(CornerRadius::same(8))
-        .stroke(Stroke::new(1.0, palette().stroke))
-        .inner_margin(Margin {
-            left: 16,
-            right: 16,
-            top: 12,
-            bottom: 14,
-        })
-        .show(ui, |ui| {
-            if let Some(l) = lang {
-                ui.label(
-                    RichText::new(l)
-                        .monospace()
-                        .size(f * 0.72)
-                        .color(palette().faint),
-                );
-                ui.add_space(6.0);
-            }
-            ScrollArea::horizontal()
-                .id_salt(ui.scope_id().with("code_scroll"))
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    let job = highlight(code, FontId::monospace(f * 0.88));
-                    ui.add(Label::new(job));
-                });
-        });
+    card_frame(Margin {
+        left: 16,
+        right: 16,
+        top: 12,
+        bottom: 14,
+    })
+    .show(ui, |ui| {
+        if let Some(l) = lang {
+            ui.label(
+                RichText::new(l)
+                    .monospace()
+                    .size(f * 0.72)
+                    .color(palette().faint),
+            );
+            ui.add_space(6.0);
+        }
+        ScrollArea::horizontal()
+            .id_salt(ui.scope_id().with("code_scroll"))
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let job = highlighted_code(ui.ctx(), code, f);
+                ui.add(Label::new(job));
+            });
+    });
     ui.add_space(f * 0.5);
 }
 
@@ -6555,10 +6536,12 @@ fn is_type_word(w: &str) -> bool {
 
 /// Minimal but robust tokenizer producing a colored [`egui::text::LayoutJob`].
 ///
-/// Handles line comments (`//`, `#`), block comments (`/* … */`), single- and
-/// double-quoted strings, numbers, keywords and CamelCase types. It is
-/// intentionally language-agnostic: no grammar, no external dependency.
-pub fn highlight(code: &str, font: FontId) -> egui::text::LayoutJob {
+/// Handles line comments (`//`, `#`), single- and double-quoted strings,
+/// numbers, keywords and CamelCase types. Block comments (`/* … */`) are only
+/// recognized within one line: the state resets at every line break, so a
+/// comment that spans lines is highlighted line by line. It is intentionally
+/// language-agnostic: no grammar, no external dependency.
+fn highlight(code: &str, font: FontId) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     fn push_fmt(job: &mut egui::text::LayoutJob, font: &FontId, s: &str, c: Color32) {
         if !s.is_empty() {
@@ -6692,7 +6675,136 @@ pub fn highlight(code: &str, font: FontId) -> egui::text::LayoutJob {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Button with a hover tooltip.
+/// Non-blank `value`, or `fallback` when `value` is empty or only whitespace.
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+/// Hash used for temp file names and cache keys. Stable within one run.
+fn hash_key(value: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `file://` URI for a local image path, as egui's file loader reads it.
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+/// `file://` URL for handing a local file to the system. Spaces and the
+/// characters that end a URL path are escaped.
+fn file_url(path: &Path) -> String {
+    let escaped = path
+        .display()
+        .to_string()
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    format!("file://{escaped}")
+}
+
+/// Rounded panel for code blocks, diagrams, media and other cards.
+fn card_frame(margin: Margin) -> Frame {
+    Frame::new()
+        .fill(palette().bg2)
+        .stroke(Stroke::new(1.0, palette().stroke))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(margin)
+}
+
+/// Frame of the blocking sheets (save changes, WeasyPrint setup).
+fn modal_frame() -> Frame {
+    Frame::new()
+        .fill(palette().bg3)
+        .stroke(Stroke::new(1.0, palette().faint))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(20))
+}
+
+/// Draws a 1 px horizontal rule across the available width.
+fn hairline(ui: &mut Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette().stroke);
+}
+
+/// Pill-shaped button of the blocking sheets. The primary action is filled
+/// with the accent color; the others are outlined.
+fn modal_button(
+    ui: &mut Ui,
+    label: &str,
+    size: f32,
+    primary: bool,
+    min_width: f32,
+) -> egui::Response {
+    let (text, fill, stroke, radius, height) = if primary {
+        (
+            Color32::WHITE,
+            palette().accent,
+            Stroke::new(2.0, palette().accent),
+            18,
+            34.0,
+        )
+    } else {
+        (
+            palette().text,
+            palette().bg2,
+            Stroke::new(1.2, palette().faint),
+            16,
+            32.0,
+        )
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).size(size).color(text))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(CornerRadius::same(radius))
+            .min_size(Vec2::new(min_width, height)),
+    )
+}
+
+/// Borderless heading button with a ▼/▶ arrow. Returns `true` when clicked.
+fn disclosure_button(ui: &mut Ui, open: bool, label: &str, font: FontId, color: Color32) -> bool {
+    let arrow = if open { "▼" } else { "▶" };
+    ui.add(
+        egui::Button::new(
+            RichText::new(format!("{arrow} {label}"))
+                .font(font)
+                .color(color),
+        )
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(4)),
+    )
+    .clicked()
+}
+
+/// Shared click handling for wiki links and embeds: pointing-hand cursor, and
+/// a click opens the resolved note in a tab.
+fn wiki_target_response(
+    ui: &mut Ui,
+    response: egui::Response,
+    target: &str,
+    base_dir: Option<&Path>,
+) -> egui::Response {
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked()
+        && let Some(path) = resolve_link_target(target, base_dir, true)
+    {
+        queue_open_document(ui, path);
+    }
+    response
+}
+
 /// Magnification shown in the toolbar, relative to [`DEFAULT_FONT_SIZE`].
 ///
 /// Rounded to whole percent: the underlying font size changes in 1 px steps
@@ -6701,43 +6813,66 @@ fn magnification_percent(font_size: f32) -> f32 {
     (font_size / DEFAULT_FONT_SIZE * 100.0).round()
 }
 
-/// Turns a title into a safe file-name stem.
+/// Turns a title into a safe file-name stem: letters, digits and spaces are
+/// kept (spaces become underscores), other characters become dashes. The
+/// result is capped at 200 bytes and is empty for an empty title.
 fn slug(s: &str) -> String {
-    let cleaned: String = s
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == ' ' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    const MAX_BYTES: usize = 200;
+    let mut cleaned = String::new();
+    for c in s.trim().chars() {
+        let c = if c.is_alphanumeric() || c == ' ' {
+            c
+        } else {
+            '-'
+        };
+        if cleaned.len() + c.len_utf8() > MAX_BYTES {
+            break;
+        }
+        cleaned.push(c);
+    }
     cleaned.replace(' ', "_")
 }
 
-/// Shortens long paths for the toolbar (keeps the tail).
+/// Shortens long paths for the toolbar, keeping the last 47 characters.
 fn ellipsize_path(p: &Path) -> String {
     let s = p.display().to_string();
-    if s.len() > 48 {
-        format!("…{}", &s[s.len() - 47..])
-    } else {
-        s
+    if s.len() <= 48 {
+        return s;
+    }
+    let skip = s.chars().count().saturating_sub(47);
+    format!("…{}", s.chars().skip(skip).collect::<String>())
+}
+
+/// Returns `true` for file extensions listed in [`MARKDOWN_EXTENSIONS`].
+fn is_markdown(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+        MARKDOWN_EXTENSIONS
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+    })
+}
+
+/// Removes `md-viewer-print-*.pdf` files in `dir` that are older than `max_age`.
+fn remove_stale_print_files(dir: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_print_pdf = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("md-viewer-print-") && name.ends_with(".pdf"));
+        let age = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
+        if is_print_pdf && age.is_some_and(|age| age > max_age) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
-/// Returns `true` for file extensions treated as Markdown/text.
-fn is_markdown(p: &Path) -> bool {
-    matches!(
-        p.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase()),
-        Some(ext) if ext == "md" || ext == "markdown" || ext == "mdown" || ext == "txt"
-    )
-}
-
-/// Converts a character index into a 1-based (line, column) pair.
 /// Character index (as used by egui's `TextEdit`) at the start of `line`.
 ///
 /// `line` is 1-based and clamped to the document length.
@@ -6757,6 +6892,7 @@ fn line_to_char_index(text: &str, line: usize) -> usize {
     index
 }
 
+/// Converts a character index into a 1-based (line, column) pair.
 fn char_to_line_col(text: &str, index: usize) -> (usize, usize) {
     let (mut line, mut col) = (1usize, 1usize);
     for (n, c) in text.chars().enumerate() {
@@ -6785,15 +6921,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Never lose unsaved edits when the window is closed. While the
-        // tab-close sheet is open, keep the window open until it is resolved.
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.dirty_count() > 0
-            && self.pending_tab_close.is_none()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_dialog = true;
-        }
+        self.guard_window_close(&ctx);
 
         // While a modal is open it owns the input: no document shortcuts, no
         // split/view changes behind it.
@@ -6826,11 +6954,14 @@ impl eframe::App for App {
             ViewMode::Preview => self.preview_central(ui),
             ViewMode::Editor => self.edit_split(ui),
         }
-        // A link click in the preview may target another Markdown file.
+        // A link click in the preview may target another document.
         if let Some(path) = ctx.data_mut(|data| data.remove_temp::<PathBuf>(pending_open_id())) {
-            self.open_path(path);
+            self.open_linked_path(&ctx, path);
         }
         set_preview_find(None);
+        if let Some((_, _, at)) = &self.status {
+            ctx.request_repaint_after(STATUS_DURATION.saturating_sub(at.elapsed()));
+        }
         self.show_image_viewer(&ctx);
         self.show_close_dialog(&ctx);
         self.show_tab_close_dialog(&ctx);
@@ -6871,7 +7002,6 @@ mod render_smoke_tests {
 
         let mut image_click = None;
         let mut math_cache = MathCache::default();
-        let mut source_jump = None;
         let mut preview_line = None;
         let mut preview_top_line = 1usize;
         let mut metrics = PreviewMetrics::default();
@@ -6894,7 +7024,6 @@ mod render_smoke_tests {
                     true,
                     &mut image_click,
                     &mut math_cache,
-                    &mut source_jump,
                     &mut preview_line,
                     &mut preview_top_line,
                     &mut metrics,
@@ -7077,7 +7206,7 @@ mod startup_tests {
 mod tab_tests {
     use super::*;
 
-    fn test_app() -> App {
+    pub(super) fn test_app() -> App {
         let text = "# One\n\nbody\n".to_string();
         let doc = parser::parse(&text);
         let mut app = App {
@@ -7091,6 +7220,8 @@ mod tab_tests {
             pending_tab_close: None,
             mode: ViewMode::Preview,
             outline_open: false,
+            outline: Arc::new(Vec::new()),
+            outline_revision: 0,
             find_open: false,
             find_query: String::new(),
             replace_text: String::new(),
@@ -7104,6 +7235,7 @@ mod tab_tests {
             line_count: 2,
             word_count: 2,
             last_cursor: (1, 1),
+            cursor_key: None,
             last_title: String::new(),
             image_viewer: None,
             math_cache: MathCache::default(),
@@ -7241,11 +7373,11 @@ mod tab_tests {
 
     #[test]
     fn outline_entries_follow_headings() {
-        let app = test_app();
-        let entries = app.outline_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].1, 1);
-        assert_eq!(entries[0].2, "One");
+        let mut app = test_app();
+        app.refresh_outline();
+        assert_eq!(app.outline.len(), 1);
+        assert_eq!(app.outline[0].1, 1);
+        assert_eq!(app.outline[0].2, "One");
     }
 
     #[test]
@@ -7270,6 +7402,215 @@ mod tab_tests {
         assert_eq!(app.find_matches.len(), 1);
         app.find_next();
         assert_eq!(app.find_index, 0);
+    }
+
+    /// Runs one frame with a native close request and returns whether the
+    /// close was cancelled and whether the save-changes sheet was requested.
+    fn close_request(app: &mut App) -> (bool, bool) {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(raw, |ui| app.guard_window_close(ui.ctx()));
+        let cancelled = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|out| {
+                out.commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+            });
+        output.textures_delta.clear();
+        (cancelled, app.close_dialog)
+    }
+
+    #[test]
+    fn window_close_is_cancelled_while_documents_are_dirty() {
+        let mut app = test_app();
+        app.dirty = true;
+        assert_eq!(close_request(&mut app), (true, true));
+    }
+
+    #[test]
+    fn window_close_leaves_the_decision_to_a_pending_tab_sheet() {
+        let mut app = test_app();
+        app.dirty = true;
+        app.pending_tab_close = Some(0);
+        assert_eq!(close_request(&mut app), (true, false));
+    }
+
+    #[test]
+    fn editing_with_an_active_query_does_not_move_the_caret() {
+        let mut app = test_app();
+        app.find_query = "body".into();
+        assert!(app.update_find_matches(), "a new query reports a change");
+        assert_eq!(app.find_matches.len(), 1);
+
+        app.text.push_str("body again\n");
+        app.reparse();
+        assert!(!app.update_find_matches(), "an edit only refreshes matches");
+        assert_eq!(app.find_matches.len(), 2);
+        assert_eq!((app.preview_line, app.jump_line), (None, None));
+    }
+
+    #[test]
+    fn a_new_query_starts_at_the_first_match() {
+        let mut app = test_app();
+        app.find_query = "a".into();
+        app.update_find_matches();
+        app.find_index = 1;
+        app.find_query = "ab".into();
+        app.update_find_matches();
+        assert_eq!(app.find_index, 0);
+    }
+
+    #[test]
+    fn replacing_with_text_that_contains_the_query_moves_past_it() {
+        let mut app = test_app();
+        app.text = "body body\n".into();
+        app.reparse();
+        app.find_query = "body".into();
+        app.replace_text = "body!".into();
+        app.replace_current();
+        assert_eq!(app.text, "body! body\n");
+        assert_eq!(app.find_index, 1, "the second original match is next");
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn replacing_with_the_same_text_is_not_an_edit() {
+        let mut app = test_app();
+        app.find_query = "body".into();
+        app.replace_text = "body".into();
+        app.replace_all();
+        app.replace_current();
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn opening_a_file_in_place_resets_the_cursor_position() {
+        let mut app = test_app();
+        app.last_cursor = (42, 7);
+        app.open_path_in_current_tab(temp_file("cursor", "# C\n"));
+        assert_eq!(app.last_cursor, (1, 1));
+    }
+
+    #[test]
+    fn preview_navigation_queues_a_caret_jump_only_in_edit_mode() {
+        let mut app = test_app();
+        app.jump_to_line(3);
+        assert_eq!(app.preview_line, Some(3));
+        assert_eq!(app.jump_line, None);
+
+        app.mode = ViewMode::Editor;
+        app.jump_to_line(5);
+        assert_eq!(app.jump_line, Some(5));
+    }
+
+    #[test]
+    fn switching_tabs_does_not_replay_a_stale_caret_jump() {
+        let mut app = test_app();
+        app.jump_line = Some(3);
+        app.load_tab(TabState::blank());
+        assert_eq!(app.jump_line, None);
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn long_paths_are_shortened_on_character_boundaries() {
+        let ascii = Path::new("/Users/someone/Documents/projects/markdown/notes/file.md");
+        let label = ellipsize_path(ascii);
+        assert!(label.starts_with('…') && label.ends_with("file.md"));
+
+        let accented =
+            PathBuf::from("/Users/someone/Dokumente/Größe-Übersicht-αβγδ-😀/Notiz-ähnlich.md");
+        assert!(accented.display().to_string().len() > 48);
+        let label = ellipsize_path(&accented);
+        assert!(label.starts_with('…') && label.ends_with("Notiz-ähnlich.md"));
+    }
+
+    #[test]
+    fn file_names_from_titles_are_safe() {
+        assert_eq!(slug(""), "");
+        assert_eq!(slug("My Note: Draft/1"), "My_Note-_Draft-1");
+        assert!(slug(&"ü".repeat(300)).len() <= 200);
+
+        let mut app = super::tab_tests::test_app();
+        assert_eq!(app.default_file_name("md"), "One.md");
+        app.doc = parser::parse("body only\n");
+        assert_eq!(app.default_file_name("pdf"), "document.pdf");
+    }
+
+    #[test]
+    fn stale_print_pdfs_are_removed_and_other_files_kept() {
+        let dir = std::env::temp_dir().join(format!("mdviewer-print-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("md-viewer-print-1-1.pdf");
+        let fresh = dir.join("md-viewer-print-1-2.pdf");
+        let other = dir.join("notes.pdf");
+        for path in [&old, &fresh, &other] {
+            std::fs::write(path, b"%PDF").unwrap();
+        }
+        let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        for path in [&old, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+
+        remove_stale_print_files(&dir, Duration::from_secs(60 * 60));
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(other.exists(), "only print files are removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fenced_div_colors_match_whole_words() {
+        assert_eq!(fenced_div_color("multiple"), palette().accent);
+        assert_eq!(fenced_div_color("stipulation"), palette().accent);
+        assert_eq!(fenced_div_color("tip"), palette().green);
+        assert_eq!(fenced_div_color("warning-box"), palette().red);
+    }
+
+    #[test]
+    fn remote_urls_are_matched_without_case_or_slicing_errors() {
+        assert!(is_remote_url("HTTPS://example.org/a.png"));
+        assert!(!is_remote_url("ftp://example.org/a.png"));
+        assert!(!is_remote_url("héééé.png"));
+    }
+
+    #[test]
+    fn svg_detection_skips_a_byte_order_mark_and_doctype() {
+        let svg = b"\xEF\xBB\xBF<?xml version=\"1.0\"?>\n<!DOCTYPE svg>\n<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+        assert!(looks_like_svg(svg));
+        assert!(!looks_like_svg(b"<html></html>"));
+    }
+
+    #[test]
+    fn oversized_svg_documents_are_rejected() {
+        let huge =
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="20000" height="20000"></svg>"#;
+        assert!(svg_size_error(huge).is_some());
+        let small = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"></svg>"#;
+        assert!(svg_size_error(small).is_none());
+    }
+
+    #[test]
+    fn download_limits_reject_oversized_payloads() {
+        assert!(check_download_limits(&vec![0u8; MAX_REMOTE_BYTES + 1]).is_err());
+        let png = include_bytes!("../assets/AppIcon-1024.png");
+        assert!(check_download_limits(png).is_ok());
     }
 }
 
@@ -7495,7 +7836,7 @@ mod jump_tests {
             });
             let mut output = ctx.run_ui(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    preview_ui(
+                    if let Some(line) = preview_ui(
                         ui,
                         &doc,
                         16.0,
@@ -7503,12 +7844,13 @@ mod jump_tests {
                         true,
                         &mut image_click,
                         &mut math_cache,
-                        &mut source_jump,
                         &mut preview_line,
                         &mut preview_top_line,
                         &mut preview_metrics,
                         0,
-                    );
+                    ) {
+                        source_jump = Some(line);
+                    }
                 });
             });
             output.textures_delta.clear();
