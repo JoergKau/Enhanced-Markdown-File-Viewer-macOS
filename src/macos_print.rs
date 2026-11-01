@@ -17,7 +17,7 @@ pub fn print_pdf(path: &std::path::Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2::{AnyThread, MainThreadMarker};
-    use objc2_app_kit::NSPrintInfo;
+    use objc2_app_kit::{NSApplication, NSPrintInfo};
     use objc2_foundation::{NSString, NSURL};
     use objc2_pdf_kit::{PDFDocument, PDFPrintScalingMode};
     use std::path::Path;
@@ -44,7 +44,22 @@ mod imp {
         }
         .ok_or("could not create the print operation")?;
 
-        if operation.runOperation() {
+        // Attach the panel as a sheet to the main window. A free-standing
+        // panel can end up behind the window, leaving the app blocked with no
+        // visible dialog.
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(window) = app.keyWindow().or_else(|| app.mainWindow()) {
+            // SAFETY: main thread; the sheet is retained by AppKit.
+            unsafe {
+                operation.runOperationModalForWindow_delegate_didRunSelector_contextInfo(
+                    &window,
+                    None,
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+            Ok(())
+        } else if operation.runOperation() {
             Ok(())
         } else {
             Err("printing was cancelled".into())
