@@ -65,6 +65,8 @@ mod html_export;
 #[cfg(target_os = "macos")]
 mod macos_about;
 mod macos_open;
+#[cfg(target_os = "macos")]
+mod macos_print;
 mod parser;
 #[cfg(test)]
 mod test_fixtures;

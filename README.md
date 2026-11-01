@@ -325,7 +325,7 @@ iconutil -c icns AppIcon.iconset -o AppIcon.icns
 | Save | Toolbar **Save**, ⌘S |
 | Save as | ⌘⇧S |
 | Export PDF | Toolbar **Export PDF**, ⌘E. Without WeasyPrint the button is greyed out and opens the setup dialog; the rest of the app works normally |
-| Print | Toolbar **Print**, ⌘P — exports a temporary PDF and opens it in Preview for the system print dialog |
+| Print | Toolbar **Print**, ⌘P — exports a temporary PDF and shows the native macOS print dialog |
 | Find & replace | Toolbar **Find**, ⌘F; ⌘G / ⇧⌘G next/previous, Esc closes |
 | Outline | Toolbar **Outline**, ⌘⇧O — click a heading to jump to that section |
 | Toggle dark / Paper theme | Toolbar sun/moon button at the right (sun = dark active, moon = Paper active) |

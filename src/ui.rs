@@ -1260,8 +1260,8 @@ impl App {
         }
     }
 
-    /// Prints the current document: exports a temporary PDF and opens it in
-    /// Preview, where the system print dialog is available (⌘P there).
+    /// Prints the current document: exports a temporary PDF and shows the
+    /// native macOS print dialog (PDFKit).
     fn print_document(&mut self) {
         self.refresh_weasyprint();
         if !self.weasyprint_ready {
@@ -1279,20 +1279,20 @@ impl App {
         ));
         match crate::export::export_pdf(&self.text, base_dir.as_deref(), self.path.as_deref(), &pdf)
         {
-            Ok(path) => match std::process::Command::new("/usr/bin/open")
-                .args(["-a", "Preview"])
-                .arg(&path)
-                .status()
-            {
-                Ok(status) if status.success() => self.set_status(
-                    "Opened the print preview in Preview — press ⌘P there to print.",
-                    false,
-                ),
-                _ => self.set_status(
-                    format!("PDF created: {} — open it to print.", path.display()),
-                    true,
-                ),
-            },
+            Ok(path) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let result = crate::macos_print::print_pdf(&path);
+                    let _ = std::fs::remove_file(&path);
+                    match result {
+                        Ok(()) => self.set_status("Sent to the printer.", false),
+                        Err(e) if e.contains("cancelled") => {
+                            self.set_status("Print cancelled.", false)
+                        }
+                        Err(e) => self.set_status(format!("Print failed: {e}"), true),
+                    }
+                }
+            }
             Err(e) => self.set_status(format!("Print failed: {e}"), true),
         }
     }
@@ -1444,7 +1444,7 @@ impl App {
                     };
                     let print = ui.add(egui::Button::new(print_text));
                     let print = if self.weasyprint_ready {
-                        print.on_hover_text("Print (⌘P) — opens a temporary PDF in Preview")
+                        print.on_hover_text("Print (⌘P) — native print dialog")
                     } else {
                         print.on_hover_text(
                             "WeasyPrint is not installed — click to set up PDF export",
