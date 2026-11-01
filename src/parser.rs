@@ -1086,11 +1086,10 @@ fn text_needles(text: &str) -> Vec<String> {
 /// real newline after callout parsing, where the original line boundary is
 /// needed to separate an Obsidian callout title from its body.
 ///
-/// The viewer intentionally uses *strict line breaks* (the behaviour of
-/// Obsidian, Typora and GitHub-rendered READMEs): a single newline in the
-/// source starts a new visual line. Pre-wrapped documents such as README.md
-/// therefore keep their intended line structure instead of being reflowed
-/// into one long paragraph.
+/// Marks a soft line break (a newline inside a paragraph). Callout titles are
+/// split at this marker; afterwards it becomes a space, so paragraphs reflow to
+/// the window width as in CommonMark and GitHub. Hard breaks (two trailing
+/// spaces or a backslash) stay line breaks.
 const SOFT_BREAK: char = '\u{E010}';
 
 /// Placeholder fenced language for protected display math.
@@ -3562,15 +3561,15 @@ fn postprocess_blocks(blocks: &mut Vec<Block>) {
     normalize_soft_breaks(blocks);
 }
 
-/// Finalizes soft line breaks: every remaining line boundary becomes a real
-/// newline (strict line breaks). Callout titles have already been extracted,
-/// so the marker has done its job.
+/// Finalizes soft line breaks: every remaining one becomes a space, so the
+/// paragraph reflows. Callout titles have already been extracted, so the
+/// marker has done its job.
 fn normalize_soft_breaks(blocks: &mut [Block]) {
     fn inlines(v: &mut [Inline]) {
         for i in v.iter_mut() {
             match i {
                 Inline::Text(t) if t.contains(SOFT_BREAK) => {
-                    *t = t.replace(SOFT_BREAK, "\n");
+                    *t = t.replace(SOFT_BREAK, " ");
                 }
                 _ => inlines(i.children_mut()),
             }
@@ -4073,14 +4072,19 @@ mod tests {
     }
 
     #[test]
-    fn soft_line_breaks_are_preserved() {
-        let doc = parse("first line\nsecond line\n\nthird paragraph");
+    fn soft_line_breaks_reflow_and_hard_breaks_stay() {
+        let doc = parse("first line\nsecond line\n\nhard  \nbreak\n\nthird paragraph");
         let Block::Paragraph(first) = &doc.blocks[0] else {
             panic!("expected paragraph");
         };
         let text: String = first.iter().map(Inline::plain_text).collect();
-        assert_eq!(text, "first line\nsecond line");
-        assert_eq!(doc.blocks.len(), 2);
+        assert_eq!(text, "first line second line");
+        let Block::Paragraph(hard) = &doc.blocks[1] else {
+            panic!("expected paragraph");
+        };
+        let text: String = hard.iter().map(Inline::plain_text).collect();
+        assert_eq!(text, "hard\nbreak");
+        assert_eq!(doc.blocks.len(), 3);
     }
 
     #[test]
