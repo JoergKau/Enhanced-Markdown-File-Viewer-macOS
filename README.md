@@ -82,7 +82,7 @@ cargo --version
 ## Quick Start
 
 ```bash
-git clone <repository-url> MD-Viewer
+git clone https://github.com/JoergKau/Enhanced-Markdown-File-Viewer-macOS.git MD-Viewer
 cd MD-Viewer
 cargo run --release
 ```

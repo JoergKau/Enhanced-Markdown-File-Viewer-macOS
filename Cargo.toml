@@ -3,7 +3,7 @@ name = "md_viewer"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/JoergKau/MD-Viewer"
+repository = "https://github.com/JoergKau/Enhanced-Markdown-File-Viewer-macOS"
 description = "Native Markdown editor and viewer for macOS on Apple Silicon"
 
 [dependencies]
