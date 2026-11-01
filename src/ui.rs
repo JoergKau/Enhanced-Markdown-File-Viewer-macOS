@@ -330,6 +330,15 @@ enum ViewMode {
     Editor,
 }
 
+/// A pending caret move for the source editor, see [`App::jump_line`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditorJump {
+    line: usize,
+    /// `false` moves the caret and scroll without taking keyboard focus, so a
+    /// find that is driven from the find bar keeps typing there.
+    focus: bool,
+}
+
 impl ViewMode {
     /// The other view mode (⌘⇧P).
     fn toggled(self) -> Self {
@@ -845,7 +854,7 @@ pub struct App {
     /// Pending caret move for the source editor (Edit mode only), set by
     /// preview clicks, outline clicks and find reveals. Consumed by
     /// [`editor_ui`] on the next frame.
-    jump_line: Option<usize>,
+    jump_line: Option<EditorJump>,
     /// Pending preview scroll target (source line) when switching from the
     /// editor back to the rendered preview.
     preview_line: Option<usize>,
@@ -1162,7 +1171,7 @@ impl App {
                 (ViewMode::Preview, ViewMode::Editor) => {
                     let line = self.preview_top_line.max(1);
                     self.preview_line = Some(line);
-                    self.jump_line = Some(line);
+                    self.jump_line = Some(EditorJump { line, focus: true });
                 }
                 _ => {}
             }
@@ -1666,16 +1675,20 @@ impl App {
         query_changed
     }
 
-    /// Scrolls the preview to source `line`. In Edit mode the caret moves there too.
+    /// Scrolls the preview to source `line`. In Edit mode the caret moves there
+    /// too and the editor takes focus.
     fn jump_to_line(&mut self, line: usize) {
         self.preview_line = Some(line);
         if self.mode == ViewMode::Editor {
-            self.jump_line = Some(line);
+            self.jump_line = Some(EditorJump { line, focus: true });
         }
     }
 
-    /// Makes match `index` the current one and scrolls to it.
-    fn reveal_match(&mut self, index: usize) {
+    /// Makes match `index` the current one and scrolls the preview to it.
+    ///
+    /// With `move_editor`, Edit mode also moves the caret to the match without
+    /// taking focus, so the find bar keeps the keyboard.
+    fn reveal_match(&mut self, index: usize, move_editor: bool) {
         let Some((start, _)) = self.find_matches.get(index).copied() else {
             return;
         };
@@ -1684,14 +1697,17 @@ impl App {
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
-        self.jump_to_line(line);
+        self.preview_line = Some(line);
+        if move_editor && self.mode == ViewMode::Editor {
+            self.jump_line = Some(EditorJump { line, focus: false });
+        }
     }
 
     fn find_next(&mut self) {
         self.update_find_matches();
         let count = self.find_matches.len();
         if count > 0 {
-            self.reveal_match((self.find_index + 1) % count);
+            self.reveal_match((self.find_index + 1) % count, true);
         }
     }
 
@@ -1699,7 +1715,15 @@ impl App {
         self.update_find_matches();
         let count = self.find_matches.len();
         if count > 0 {
-            self.reveal_match((self.find_index + count - 1) % count);
+            self.reveal_match((self.find_index + count - 1) % count, true);
+        }
+    }
+
+    /// Refreshes the matches for the query being typed. A changed query scrolls
+    /// the preview to its first match, but never moves the editor.
+    fn refresh_find(&mut self) {
+        if self.update_find_matches() {
+            self.reveal_match(self.find_index, false);
         }
     }
 
@@ -1723,7 +1747,7 @@ impl App {
             .iter()
             .position(|(match_start, _)| *match_start >= after)
             .unwrap_or(0);
-        self.reveal_match(next);
+        self.reveal_match(next, true);
     }
 
     /// Replaces every match in one pass.
@@ -1743,14 +1767,12 @@ impl App {
         self.dirty = true;
         self.reparse();
         self.update_find_matches();
-        self.reveal_match(0);
+        self.reveal_match(0, true);
     }
 
     /// Find/replace bar below the toolbar.
     fn find_bar(&mut self, ui: &mut Ui) {
-        if self.update_find_matches() {
-            self.reveal_match(self.find_index);
-        }
+        self.refresh_find();
         egui::Panel::top("findbar")
             .frame(
                 Frame::new()
@@ -2186,7 +2208,9 @@ impl App {
                 });
 
                 self.split_fraction = new_fraction;
-                self.jump_line = source_jump.or(jump_line);
+                self.jump_line = source_jump
+                    .map(|line| EditorJump { line, focus: true })
+                    .or(jump_line);
                 if changed {
                     self.dirty = true;
                     self.reparse();
@@ -2793,12 +2817,20 @@ fn clear_selection_cache(ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove::<egui::text::CCursorRange>(selection_cache_id()));
 }
 
-/// Moves the caret or selection of the editor `id` and focuses the editor.
-fn set_editor_cursor(ctx: &egui::Context, id: egui::Id, range: egui::text::CCursorRange) {
+/// Moves the caret or selection of the editor `id`, and focuses the editor
+/// when `focus` is set.
+fn set_editor_cursor(
+    ctx: &egui::Context,
+    id: egui::Id,
+    range: egui::text::CCursorRange,
+    focus: bool,
+) {
     let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
     state.cursor.set_char_range(Some(range));
     state.store(ctx, id);
-    ctx.memory_mut(|memory| memory.request_focus(id));
+    if focus {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
 }
 
 /// Cuts the selected text and updates the stored cursor position.
@@ -2814,7 +2846,7 @@ fn editor_cut(
     let range = range.filter(|r| !r.is_empty())?;
     ctx.copy_text(range.slice_str(text).to_string());
     let new_cursor = egui::TextBuffer::delete_selected(text, &range);
-    set_editor_cursor(ctx, id, egui::text::CCursorRange::one(new_cursor));
+    set_editor_cursor(ctx, id, egui::text::CCursorRange::one(new_cursor), true);
     clear_selection_cache(ctx);
     Some(new_cursor)
 }
@@ -2833,7 +2865,7 @@ fn editor_paste(ctx: &egui::Context, id: egui::Id) {
 /// Selects the whole editor buffer.
 fn editor_select_all(ctx: &egui::Context, text: &str, id: egui::Id) {
     let selection = egui::text::CCursorRange::select_all_str(text);
-    set_editor_cursor(ctx, id, selection);
+    set_editor_cursor(ctx, id, selection, true);
     ctx.data_mut(|d| d.insert_temp(selection_cache_id(), selection));
 }
 
@@ -2852,7 +2884,7 @@ fn editor_ui(
     last_cursor: &mut (usize, usize),
     cursor_key: &mut Option<(usize, u64)>,
     revision: u64,
-    jump_line: &mut Option<usize>,
+    jump_line: &mut Option<EditorJump>,
 ) -> bool {
     let ctx = ui.ctx().clone();
     let mut changed = false;
@@ -2885,17 +2917,18 @@ fn editor_ui(
             if (menu_open || secondary_active)
                 && let Some(selection) = cached_selection
             {
-                set_editor_cursor(&ctx, editor_id, selection);
+                set_editor_cursor(&ctx, editor_id, selection, true);
             }
 
             // A click in the preview requests a jump; move the text cursor
             // before the widget is shown so the selection and caret follow.
-            if let Some(line) = jump {
+            if let Some(EditorJump { line, focus }) = jump {
                 let index = line_to_char_index(text, line);
                 set_editor_cursor(
                     &ctx,
                     editor_id,
                     egui::text::CCursorRange::one(egui::text::CCursor::new(index)),
+                    focus,
                 );
             }
 
@@ -7507,13 +7540,44 @@ mod tab_tests {
 
         app.mode = ViewMode::Editor;
         app.jump_to_line(5);
-        assert_eq!(app.jump_line, Some(5));
+        assert_eq!(
+            app.jump_line,
+            Some(EditorJump {
+                line: 5,
+                focus: true
+            })
+        );
+    }
+
+    #[test]
+    fn typing_in_find_never_moves_the_editor() {
+        let mut app = test_app();
+        app.text = "alpha\nbeta\ngamma beta\n".into();
+        app.reparse();
+        app.mode = ViewMode::Editor;
+
+        app.find_query = "beta".into();
+        app.refresh_find();
+        assert_eq!(app.preview_line, Some(2));
+        assert_eq!(app.jump_line, None);
+
+        app.find_next();
+        assert_eq!(
+            app.jump_line,
+            Some(EditorJump {
+                line: 3,
+                focus: false
+            })
+        );
     }
 
     #[test]
     fn switching_tabs_does_not_replay_a_stale_caret_jump() {
         let mut app = test_app();
-        app.jump_line = Some(3);
+        app.jump_line = Some(EditorJump {
+            line: 3,
+            focus: true,
+        });
         app.load_tab(TabState::blank());
         assert_eq!(app.jump_line, None);
     }

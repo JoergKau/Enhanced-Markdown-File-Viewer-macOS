@@ -73,7 +73,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 - Rust 2024 · eframe/egui 0.37 · wgpu (Metal) · winit 0.30 ·
   pulldown-cmark 0.13 · arm64 macOS 11+.
-- 172 unit/integration tests plus an ignored deep render pass; zero build,
+- 173 unit/integration tests plus an ignored deep render pass; zero build,
   clippy and rustfmt warnings.
 - `.app` packaging with ad-hoc or Developer ID signing, optional notarization,
   and a zipped arm64 release archive with SHA-256 checksum.
