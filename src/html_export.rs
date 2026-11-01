@@ -275,15 +275,13 @@ fn preprocess_callouts(markdown: &str) -> String {
             }
             let body = content_lines.join("\n");
 
+            // Folded callouts print expanded, as the preview shows them, so
+            // `+` and `-` only matter for the collapsible header.
             let (open, close) = match fold {
-                Some("+") => (
+                Some(_) => (
                     format!(
                         "<details class=\"callout {kind}\" open=\"open\"><summary>{summary}</summary>"
                     ),
-                    "</details>",
-                ),
-                Some(_) => (
-                    format!("<details class=\"callout {kind}\"><summary>{summary}</summary>"),
                     "</details>",
                 ),
                 None => (
@@ -1312,8 +1310,10 @@ mod tests {
     /// `-` folds a callout closed and `+` opens it, as in the preview.
     #[test]
     fn callout_fold_markers() {
-        let collapsed = render_markdown("> [!tip]-\n> Hidden", None);
-        assert!(collapsed.contains("<details class=\"callout tip\"><summary>Tip</summary>"));
+        let folded = render_markdown("> [!tip]-\n> Shown", None);
+        assert!(
+            folded.contains("<details class=\"callout tip\" open=\"open\"><summary>Tip</summary>")
+        );
         let expanded = render_markdown("> [!tip]+\n> Shown", None);
         assert!(expanded.contains("<details class=\"callout tip\" open=\"open\">"));
     }
