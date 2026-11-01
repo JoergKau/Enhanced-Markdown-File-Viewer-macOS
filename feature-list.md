@@ -53,7 +53,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 ## PDF export
 
 - One-click **Export PDF** (⌘E) with a native save dialog; **Print** (⌘P)
-  exports a temporary PDF and opens it in Preview.
+  exports a temporary PDF and shows the native macOS print dialog.
 - A4 pagination, running footer, selectable text, clickable links, embedded
   images, styled code/tables/callouts, typeset math and Mermaid diagrams.
 - Uses the mandatory **WeasyPrint** CLI — no fallback writer. When it is
