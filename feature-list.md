@@ -23,10 +23,17 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 ## Editor & preview
 
-- Rendered preview by default; **Edit** (⌘⇧P) opens a resizable split view with
-  the source editor and live preview.
-- Click any preview block to jump to the matching source line; switching views
-  keeps the section you were reading or editing.
+- Rendered preview by default; **Edit** (⌘⇧P or the toolbar) switches the
+  whole window to a centered Markdown editor — no split pane.
+- The editor styles the source live: headings scale, bold/italic/strikethrough,
+  inline and fenced code, quotes, lists, task boxes, tables, links and math are
+  recognizable while every byte remains editable. Syntax punctuation is hidden
+  except on the caret's line (or selected lines), where it appears dimmed.
+- Fenced code collapses its fence lines into a rounded card with a language
+  label; inline code keeps its own background. Inactive table delimiter rows
+  disappear, and table headers render bold.
+- Double-click any preview block to open Edit mode at that source line;
+  switching views keeps the section you were reading or editing.
 - **Find & replace** (⌘F, ⌘G/⇧⌘G) with match counter, next/previous and replace
   one/all.
 - **Outline sidebar** (⌘⇧O) listing headings; click one to jump to that section.
@@ -77,7 +84,7 @@ with egui/eframe (wgpu → Metal), winit and pulldown-cmark.
 
 - Rust 2024 · eframe/egui 0.37 · wgpu (Metal) · winit 0.30 ·
   pulldown-cmark 0.13 · arm64 macOS 11+.
-- 184 unit/integration tests plus an ignored deep render pass; zero build,
+- 192 unit/integration tests plus an ignored deep render pass; zero build,
   clippy and rustfmt warnings.
 - `.app` packaging with ad-hoc or Developer ID signing, optional notarization,
   and a zipped arm64 release archive with SHA-256 checksum.

@@ -1,6 +1,6 @@
 //! Print-ready HTML generation for the PDF export.
 //!
-//! **Print pipeline based on the reference implementation** (ported and
+//! **Print pipeline** (implemented and
 //! reimplemented in Rust), extended where that output fell short:
 //!
 //! ```text
@@ -19,13 +19,13 @@
 //!   ├─ restore inline code; Mermaid fences → PNG images
 //!   ├─ pulldown-cmark push_html (GFM | TABLES | TASKLISTS | FOOTNOTES)
 //!   └─ ammonia sanitize (script removed, tables/img/details kept)
-//!        └─ wrap in the print template (the reference implementation's +
+//!        └─ wrap in the print template (the pipeline's +
 //!           .markdown-body print CSS) → temporary HTML
 //!              └─ weasyprint CLI → PDF  (see export.rs)
 //! ```
 //!
-//! The preprocessors, sanitizer, template and print CSS are ported from
-//! the reference implementation, with deliberate improvements: WeasyPrint is mandatory (no
+//! The preprocessors, sanitizer, template and print CSS form the print
+//! pipeline, with deliberate improvements: WeasyPrint is mandatory (no
 //! fallback writer), callouts keep their body as Markdown, math and Mermaid
 //! diagrams are typeset to PNGs, and display math may span lines.
 
@@ -35,7 +35,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
-// Emoji shortcodes (ported from the reference implementation lib.rs)
+// Emoji shortcodes.
 // ---------------------------------------------------------------------------
 
 fn emoji_map() -> &'static [(&'static str, char)] {
@@ -107,7 +107,7 @@ fn emoji_map() -> &'static [(&'static str, char)] {
 }
 
 /// Preprocess emoji shortcodes (`:emoji:`) into unicode characters.
-/// (Ported 1:1 from the reference implementation.)
+/// Emoji shortcode replacement.
 fn preprocess_emojis(markdown: &str) -> String {
     static EMOJI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":([a-z0-9_+-]+):").unwrap());
     EMOJI_RE
@@ -230,7 +230,6 @@ fn preprocess_math(markdown: &str) -> String {
 /// Preprocess GitHub/Obsidian-style callouts (`[!TYPE]`, `+`/`-` fold markers)
 /// into styled HTML blocks. The body stays Markdown, separated from the
 /// block-level HTML by blank lines (as in [`preprocess_fenced_divs_html`]).
-/// (Based on the reference implementation.)
 fn preprocess_callouts(markdown: &str) -> String {
     static CALLOUT_HEADER_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^> \[!(\w+)]([+-])?(?:\s+(.*))?$").unwrap());
@@ -312,7 +311,6 @@ fn preprocess_callouts(markdown: &str) -> String {
 /// Supports: `[[Page]]`, `[[#Heading]]`, `[[Page#Heading]]`, `[[Page|Display]]`.
 /// Embeds (`![[…]]`) become images when they name an image file, and labelled
 /// spans otherwise: the PDF cannot show an embedded note.
-/// (Ported from the reference implementation.)
 fn preprocess_wikilinks(markdown: &str) -> String {
     static WIKILINK_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(!?)\[\[(.*?)\]\]").unwrap());
@@ -594,7 +592,7 @@ fn resolve_image_paths(text: &str, base_dir: Option<&Path>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Main rendering pipeline (based on the reference implementation)
+// Main rendering pipeline
 // ---------------------------------------------------------------------------
 
 /// Rasterizes inline/block `<svg>` elements to PNG images for WeasyPrint
@@ -762,7 +760,7 @@ fn preprocess_fenced_divs_html(markdown: &str) -> String {
 /// pulldown-cmark. Frontmatter is stripped, and line endings are normalised to
 /// LF first. Local images are resolved to data URIs relative to `base_dir`
 /// (the document folder). The final pulldown-cmark HTML is sanitized with
-/// ammonia (same tag/attribute policy as the reference implementation).
+/// ammonia.
 fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
     let markdown = markdown.replace("\r\n", "\n");
     let markdown = &crate::parser::expand_inline_footnotes(&markdown);
@@ -846,7 +844,7 @@ fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
         restored = restored.replace(&placeholder, &replacement);
     }
 
-    // 8. Parse markdown (same option set as the reference implementation)
+    // 8. Parse markdown
     use pulldown_cmark::{Options, Parser, html::push_html};
     let mut options = Options::empty();
     options.insert(Options::ENABLE_GFM);
@@ -857,11 +855,11 @@ fn render_markdown(markdown: &str, base_dir: Option<&Path>) -> String {
     let mut unsafe_html = String::new();
     push_html(&mut unsafe_html, parser);
 
-    // 9. Sanitize HTML (same policy as the reference implementation)
+    // 9. Sanitize HTML
     SANITIZER.clean(&unsafe_html).to_string()
 }
 
-/// Sanitizer policy for the printed HTML: the reference implementation's tags
+/// Sanitizer policy for the printed HTML: allowed tags
 /// and attributes plus the elements this pipeline emits.
 static SANITIZER: LazyLock<SanitizerBuilder<'static>> = LazyLock::new(|| {
     let mut builder = SanitizerBuilder::new();
@@ -883,7 +881,7 @@ static SANITIZER: LazyLock<SanitizerBuilder<'static>> = LazyLock::new(|| {
 });
 
 // ---------------------------------------------------------------------------
-// Print template (ported from the reference implementation)
+// Print template
 // ---------------------------------------------------------------------------
 
 /// Escapes `&`, `<`, `>`, `"` and `'` for HTML text and attribute values.
@@ -902,7 +900,7 @@ fn encode_safe(s: &str) -> String {
     out
 }
 
-/// The `.markdown-body` content styles from the reference implementation
+/// The `.markdown-body` content styles
 /// (light theme values inlined, verbatim classes) plus its `@media print`
 /// block (sized headings, break rules, black links).
 const MARKDOWN_BODY_CSS: &str = r##"
@@ -959,7 +957,7 @@ const MARKDOWN_BODY_CSS: &str = r##"
   .mermaid { margin: 1em 0; text-align: center; }
 "##;
 
-/// The print media block from the reference implementation, with one
+/// The print media block, with one
 /// deliberate pagination fix: tables may break across pages (`table` is not
 /// `page-break-inside: avoid`) and the header repeats via
 /// `table-header-group`; rows themselves stay intact. Keeping whole tables
@@ -1002,7 +1000,7 @@ fn css_string(s: &str) -> String {
     out
 }
 
-/// Builds the complete print document — the ported union of the reference implementation's
+/// Builds the complete print document — the union of the pipeline's
 /// `pdf_export.rs` template (A4 page setup, footer with
 /// `filename - Page n of m` counters) and its print `.markdown-body` styles.
 ///
@@ -1065,7 +1063,7 @@ pub fn print_html_for(markdown: &str, base_dir: Option<&Path>, filename: &str) -
 }
 
 // ---------------------------------------------------------------------------
-// Tests (ported assertions from the reference implementation's render_markdown tests plus
+// Tests covering the print pipeline:
 // template coverage)
 // ---------------------------------------------------------------------------
 
@@ -1169,7 +1167,7 @@ mod tests {
     }
 
     /// A block directly after a callout must not be swallowed into the
-    /// callout's HTML block (the reference implementation bug fixed here).
+    /// callout's HTML block (bug fixed here).
     #[test]
     fn it_keeps_fence_after_callout() {
         let output = render_markdown("> [!NOTE]\n> careful\n\n```rust\nfn main() {}\n```\n", None);
