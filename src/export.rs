@@ -1,4 +1,4 @@
-//! PDF export — mandatory WeasyPrint pipeline (ported from the reference implementation).
+//! PDF export — mandatory WeasyPrint pipeline.
 //!
 //! [`export_pdf`] renders the raw Markdown source into a complete,
 //! print-ready HTML file ([`crate::html_export`]), writes it to a temporary

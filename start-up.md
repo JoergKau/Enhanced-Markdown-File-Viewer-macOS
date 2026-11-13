@@ -15,10 +15,11 @@
 | **Code blocks** | language-aware syntax highlighting and a language label. |
 
 > [!NOTE] Editor & preview
-> - Rendered preview by default; **Edit** (⌘⇧P) opens a resizable split view with
->   the source editor and live preview.
-> - Click any preview block to jump to the matching source line; switching views
->   keeps the section you were reading or editing.
+> - Rendered preview by default; **Edit** (⌘⇧P) switches the whole window to a
+>   centered rich-text Markdown editor. Syntax markers appear only on the line
+>   you are editing, and code fences become labelled cards.
+> - Double-click any preview block to open Edit mode at that line; switching
+>   views keeps the section you were reading or editing.
 > - Multiple tabs with per-tab edits, scroll position and unsaved markers.
 > - Zoom (⌘+/⌘−, ⌘0), picture viewer with pan/zoom, drag & drop.
 > - Large documents are virtualized (visible window plus overscan) above 250

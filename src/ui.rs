@@ -3,24 +3,31 @@
 //!
 //! # Layout
 //!
-//! The app opens in the **rendered Markdown view** (no split screen). Every
-//! document has a tab in the strip below the toolbar. The toolbar can switch to
-//! **Edit**, which shows a split screen: raw Markdown on the left and the live
-//! rendered preview on the right. The split is laid out by hand inside the
-//! central panel (see `App::edit_split`), not with an egui side panel.
+//! The app opens in the **rendered Markdown view**. Every document has a tab in
+//! the strip below the toolbar. The toolbar switches the *whole window* between
+//! **Preview** and **Edit**; there is no split screen.
+//!
+//! Edit mode is a full-window, centered Markdown editor. The source stays the
+//! document; a custom layouter styles it live, hides syntax markers except on
+//! the caret's line, and renders fenced code as cards. There is no split pane
+//! and no block switching.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────┐
 //! │ toolbar (top panel)                                  │
 //! ├──────────────────────────────────────────────────────┤
 //! │ tab strip (top panel, two or more tabs)              │
-//! ├───────────────────────────┬──────────────────────────┤
-//! │ editor (left, Edit mode)  │ live preview (right,     │
-//! │                           │ Edit mode)               │
-//! ├───────────────────────────┴──────────────────────────┤
+//! ├──────────────────────────────────────────────────────┤
+//! │ edit mode: rich blocks, one raw block when focused   │
+//! │ preview mode: rendered Markdown                      │
+//! ├──────────────────────────────────────────────────────┤
 //! │ status bar (bottom panel)                            │
 //! └──────────────────────────────────────────────────────┘
 //! ```
+//!
+//! Switching modes keeps the reading position: the section at the top of the
+//! preview is revealed in the editor, and leaving Edit scrolls the preview to
+//! the same section.
 //!
 //! # State flow
 //!
@@ -36,6 +43,7 @@
 //! * Toolbar buttons: [`App::toolbar`].
 //! * Keyboard shortcuts: [`App::handle_shortcuts`].
 //! * New block/inline rendering: [`render_block`] / [`render_inlines`].
+//! * Editor syntax styling: [`markdown_editor_job`] / [`push_inline`].
 //! * Theme colors: the `theme` module and [`apply_theme`].
 //! * Syntax highlighting: [`highlight`].
 //! * System fonts: [`install_system_fonts`].
@@ -83,7 +91,7 @@ mod theme {
     pub enum Mode {
         #[default]
         Dark,
-        /// Warm off-white reading theme (the reference implementation's light "paper" look).
+        /// Warm off-white reading theme.
         Paper,
     }
 
@@ -320,13 +328,13 @@ fn startup_candidates() -> Vec<PathBuf> {
 
 /// How the document is displayed.
 ///
-/// The app opens in the rendered Markdown view by default; Edit mode shows the
-/// source editor next to the live preview.
+/// The app opens in the rendered Markdown view by default. Edit mode replaces
+/// the whole preview with a rich in-place editor; there is no split view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
     /// Rendered Markdown (default).
     Preview,
-    /// Raw Markdown source editor next to the live preview.
+    /// Rich blocks with the clicked block opened as raw source.
     Editor,
 }
 
@@ -839,8 +847,6 @@ pub struct App {
     find_index: usize,
     find_cache: (String, u64),
     find_focus: bool,
-    /// Split position in Edit mode (`0.5` = 50/50). Persists while dragging.
-    split_fraction: f32,
     /// Font size (editor & preview; ⌘+/⌘− zoom).
     font_size: f32,
     /// Status toast: (text, is_error, timestamp).
@@ -865,14 +871,14 @@ pub struct App {
     /// Cached heights for the virtualized preview.
     preview_metrics: PreviewMetrics,
     /// Pending caret move for the source editor (Edit mode only), set by
-    /// preview clicks, outline clicks and find reveals. Consumed by
-    /// [`editor_ui`] on the next frame.
+    /// preview double-clicks, outline clicks and find reveals. Consumed by
+    /// [`editor_central`] on the next frame.
     jump_line: Option<EditorJump>,
     /// Pending preview scroll target (source line) when switching from the
     /// editor back to the rendered preview.
     preview_line: Option<usize>,
     /// Source line of the first visible preview block (updated every frame).
-    /// Used when switching from Preview to Edit so both panes show the same
+    /// Used when switching from Preview to Edit so the editor opens in the
     /// section the user was reading.
     preview_top_line: usize,
     /// Open "save changes before closing?" confirmation dialog.
@@ -934,7 +940,6 @@ impl App {
             find_index: 0,
             find_cache: (String::new(), 0),
             find_focus: false,
-            split_fraction: 0.5,
             font_size: DEFAULT_FONT_SIZE,
             status: None,
             export_job: None,
@@ -1172,11 +1177,12 @@ impl App {
         }
     }
 
-    /// Switches the view mode.
+    /// Switches the whole window between Preview and Edit.
     ///
-    /// When leaving the split editor for the rendered preview, remember the
-    /// editor caret line so the preview scrolls to the same section instead of
-    /// restoring its old scroll offset.
+    /// The modes are two full-window views, so the switch also carries the
+    /// reading position across: leaving Edit scrolls the preview to the caret's
+    /// section, and entering Edit puts the caret in the section that was at
+    /// the top of the preview.
     fn set_mode(&mut self, mode: ViewMode) {
         if mode != self.mode {
             match (self.mode, mode) {
@@ -1184,8 +1190,8 @@ impl App {
                 (ViewMode::Editor, ViewMode::Preview) => {
                     self.preview_line = Some(self.last_cursor.0);
                 }
-                // Preview → split: show the section the user was reading in
-                // both the editor and the preview pane.
+                // Preview → Edit: put the caret in the section being read at
+                // the top of the preview.
                 (ViewMode::Preview, ViewMode::Editor) => {
                     let line = self.preview_top_line.max(1);
                     self.preview_line = Some(line);
@@ -1650,9 +1656,9 @@ impl App {
                     ui.separator();
                     let mut mode = self.mode;
                     ui.selectable_value(&mut mode, ViewMode::Preview, "Preview")
-                        .on_hover_text("Rendered preview (⌘⇧P)");
+                        .on_hover_text("Rendered preview — full window (⌘⇧P)");
                     ui.selectable_value(&mut mode, ViewMode::Editor, "Edit")
-                        .on_hover_text("Source editor + live preview (⌘⇧P)");
+                        .on_hover_text("Full-window Markdown editor (⌘⇧P)");
                     if mode != self.mode {
                         self.set_mode(mode);
                     }
@@ -2155,140 +2161,54 @@ impl App {
         self.tabs.len() > 1
     }
 
-    /// Edit mode: manual split screen (raw editor left, live preview right).
+    /// Edit mode: the whole window shows a centered, live-styled Markdown
+    /// editor.
     ///
-    /// The split is stateful (`split_fraction`), starts at 50/50 and keeps the
-    /// position after dragging the divider. A manual split avoids egui panel
-    /// state issues and guarantees an exact 50/50 start.
-    fn edit_split(&mut self, ui: &mut Ui) {
+    /// The layout mirrors the preview's reading column, so switching modes does
+    /// not change the measure or the vertical position of the text. See
+    /// [`editor_ui`] for the source styling.
+    /// Edit mode: the whole window shows a centered, live-styled Markdown
+    /// editor.
+    ///
+    /// The layout mirrors the preview's reading column, so switching modes does
+    /// not change the measure. See [`editor_ui`] for the source styling.
+    fn editor_central(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default_margins()
             .frame(Frame::new().fill(palette().bg0))
             .show(ui, |ui| {
-                let total_w = ui.available_width();
-                let total_h = ui.available_height();
-                let divider_w = 8.0;
-                let min_side = 260.0_f32.min((total_w - divider_w) * 0.45);
-                let max_left = (total_w - min_side - divider_w).max(min_side);
-                let left_w = (total_w * self.split_fraction).clamp(min_side, max_left);
-                let right_w = (total_w - left_w - divider_w).max(min_side);
-                // Content width inside the 24 px frame margins. Without this
-                // explicit cap the child UI can use the full pane width and
-                // clip away the right margin after a window resize.
-                let inner_left = (left_w - 48.0).max(0.0);
-                let inner_right = (right_w - 48.0).max(0.0);
-
                 let f = self.font_size;
-                let base_dir = self.base_dir();
-                let doc = &self.doc;
-                let text = &mut self.text;
-                let last_cursor = &mut self.last_cursor;
-                let cursor_key = &mut self.cursor_key;
-                let math_cache = &mut self.math_cache;
-                let preview_line = &mut self.preview_line;
-                let preview_top_line = &mut self.preview_top_line;
-                let preview_metrics = &mut self.preview_metrics;
-                let preview_revision = self.preview_revision;
+                let avail = ui.available_width();
+                let max_w = (f * 62.0).clamp(640.0, 1080.0);
+                let pad = 80.0_f32.min(avail * 0.15);
+                let width = (avail - 2.0 * pad).min(max_w).max(0.0);
+                let left = ((avail - width) * 0.5).max(0.0);
+                let total_h = ui.available_height();
                 let mut changed = false;
-                let mut new_fraction = self.split_fraction;
-                let mut image_click = None;
-                let mut source_jump = None;
-                let mut jump_line = self.jump_line.take();
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-
-                    // Left: raw Markdown editor.
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(left_w, total_h),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(left_w);
-                            ui.set_height(total_h);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add_space(24.0);
-                                ui.vertical(|ui| {
-                                    ui.set_width(inner_left);
-                                    ui.set_height(total_h);
-                                    ui.add_space(16.0);
-                                    changed = editor_ui(
-                                        ui,
-                                        text,
-                                        f,
-                                        last_cursor,
-                                        cursor_key,
-                                        preview_revision,
-                                        &mut jump_line,
-                                    );
-                                });
-                                ui.add_space(24.0);
-                            });
-                        },
-                    );
-
-                    // Draggable divider.
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::new(divider_w, total_h), egui::Sense::drag());
-                    let color = if response.hovered() || response.dragged() {
-                        palette().accent
-                    } else {
-                        palette().stroke
-                    };
-                    ui.painter().rect_filled(rect, CornerRadius::ZERO, color);
-                    if response.hovered() || response.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-                    if response.dragged()
-                        && let Some(pos) = ui.ctx().pointer_interact_pos()
-                    {
-                        let left_edge = rect.min.x - left_w;
-                        new_fraction = ((pos.x - left_edge) / total_w).clamp(0.2, 0.8);
-                    }
-
-                    // Right: live preview.
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(right_w, total_h),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(right_w);
-                            ui.set_height(total_h);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add_space(24.0);
-                                ui.vertical(|ui| {
-                                    ui.set_width(inner_right);
-                                    ui.set_height(total_h);
-                                    ui.add_space(16.0);
-                                    source_jump = preview_ui(
-                                        ui,
-                                        doc,
-                                        f,
-                                        base_dir.as_deref(),
-                                        false,
-                                        &mut image_click,
-                                        math_cache,
-                                        preview_line,
-                                        preview_top_line,
-                                        preview_metrics,
-                                        preview_revision,
-                                    );
-                                });
-                                ui.add_space(24.0);
-                            });
-                        },
-                    );
+                    ui.add_space(left);
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.set_max_width(width);
+                        ui.set_height(total_h);
+                        ui.add_space(24.0);
+                        changed = editor_ui(
+                            ui,
+                            &mut self.text,
+                            width,
+                            f,
+                            &mut self.last_cursor,
+                            &mut self.cursor_key,
+                            self.preview_revision,
+                            &mut self.jump_line,
+                        );
+                    });
                 });
 
-                self.split_fraction = new_fraction;
-                self.jump_line = source_jump
-                    .map(|line| EditorJump { line, focus: true })
-                    .or(jump_line);
                 if changed {
                     self.dirty = true;
                     self.reparse();
-                }
-                if let Some(request) = image_click {
-                    self.image_viewer = Some(ImageViewer::new(request));
                 }
             });
     }
@@ -2300,9 +2220,7 @@ impl App {
             .show(ui, |ui| {
                 let base_dir = self.base_dir();
                 let mut image_click = None;
-                // Clicks in the preview only move the caret in Edit mode, so the
-                // returned source line is ignored here.
-                preview_ui(
+                let source_line = preview_ui(
                     ui,
                     &self.doc,
                     self.font_size,
@@ -2317,6 +2235,18 @@ impl App {
                 );
                 if let Some(request) = image_click {
                     self.image_viewer = Some(ImageViewer::new(request));
+                }
+                // Double-clicking a preview block opens the editor at that
+                // section. Links and images keep their own single-click
+                // actions.
+                let follow_link = ui
+                    .ctx()
+                    .data(|data| data.get_temp::<PathBuf>(pending_open_id()).is_some());
+                if let Some(line) = source_line
+                    && !follow_link
+                {
+                    self.preview_top_line = line;
+                    self.set_mode(ViewMode::Editor);
                 }
             });
     }
@@ -2941,17 +2871,1055 @@ fn editor_select_all(ctx: &egui::Context, text: &str, id: egui::Id) {
     ctx.data_mut(|d| d.insert_temp(selection_cache_id(), selection));
 }
 
-/// Raw Markdown editor body. Returns `true` if the text changed.
+// ---------------------------------------------------------------------------
+// Live Markdown styling for the editor
+// ---------------------------------------------------------------------------
+
+/// Cached [`egui::text::LayoutJob`] for the editor source.
 ///
-/// Used inside the Edit split screen (left half). `cursor_key` caches the
-/// status-bar line and column per character index and preview revision.
+/// `TextEdit` lays the galley out again every frame, but the much more
+/// expensive part — scanning the Markdown and deciding a style for every
+/// character — only runs when the text, the font size or the theme changes.
+#[derive(Clone)]
+struct EditorJobCache {
+    text_hash: u64,
+    font: u32,
+    theme: u8,
+    /// First and last source line whose Markdown markers are visible (the
+    /// caret's line, or the selected lines). `usize::MAX` when nothing is
+    /// active and every marker is hidden.
+    active_from: usize,
+    active_to: usize,
+    job: Arc<egui::text::LayoutJob>,
+}
+
+impl EditorJobCache {
+    fn active(&self) -> Option<(usize, usize)> {
+        (self.active_from != usize::MAX).then_some((self.active_from, self.active_to))
+    }
+}
+
+fn editor_job_cache_id() -> egui::Id {
+    egui::Id::unique("md_editor_layout_job")
+}
+
+/// Returns the styled layout job for `text`, rebuilding it only when needed.
+fn cached_editor_job(
+    ctx: &egui::Context,
+    text: &str,
+    font_size: f32,
+    active: Option<(usize, usize)>,
+) -> Arc<egui::text::LayoutJob> {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    let text_hash = hasher.finish();
+    let font = font_size.to_bits();
+    let theme = theme::mode() as u8;
+    let (active_from, active_to) = active.unwrap_or((usize::MAX, usize::MAX));
+    if let Some(cache) = ctx.data(|d| d.get_temp::<EditorJobCache>(editor_job_cache_id()))
+        && cache.text_hash == text_hash
+        && cache.font == font
+        && cache.theme == theme
+        && cache.active() == active
+    {
+        return cache.job;
+    }
+    let job = Arc::new(markdown_editor_job(text, font_size, active));
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            editor_job_cache_id(),
+            EditorJobCache {
+                text_hash,
+                font,
+                theme,
+                active_from,
+                active_to,
+                job: job.clone(),
+            },
+        );
+    });
+    job
+}
+
+/// Rounded code-block cards painted behind the editor text.
+///
+/// `TextEdit` paints a single text layer, so the card geometry comes from the
+/// galley of the previous frame and is reused for the next paint. That is exact
+/// for a static document and tracks scrolling, because the bands are stored
+/// relative to the text origin.
+#[derive(Clone, Default)]
+struct EditorCodeCards {
+    font: u32,
+    bands: Vec<EditorCodeBand>,
+}
+
+/// One code-block card: its vertical extent in the text and its language.
+#[derive(Clone, PartialEq)]
+struct EditorCodeBand {
+    top: f32,
+    bottom: f32,
+    language: String,
+}
+
+fn editor_code_cards_id() -> egui::Id {
+    egui::Id::unique("md_editor_code_cards")
+}
+
+/// Content line ranges `(first, last, language)` of fenced code blocks.
+fn editor_code_line_ranges(text: &str) -> Vec<(usize, usize, String)> {
+    let mut ranges = Vec::new();
+    let mut fence: Option<(u8, usize, usize, String)> = None;
+    let mut line_count = 0;
+    for (index, line) in text.lines().enumerate() {
+        line_count = index + 1;
+        if let Some((byte, len, content_start, language)) = fence.clone() {
+            if fence_closes(line, byte, len) {
+                if index > content_start {
+                    ranges.push((content_start, index - 1, language));
+                }
+                fence = None;
+            }
+        } else if let Some((byte, len, info_start)) = fence_opener(line) {
+            let language = line[info_start..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '{' || c == '}')
+                .to_string();
+            fence = Some((byte, len, index + 1, language));
+        }
+    }
+    if let Some((_, _, content_start, language)) = fence
+        && content_start < line_count
+    {
+        ranges.push((content_start, line_count - 1, language));
+    }
+    ranges
+}
+
+/// Character offset at which each source line starts.
+fn editor_line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut chars = 0;
+    for ch in text.chars() {
+        chars += 1;
+        if ch == '\n' {
+            starts.push(chars);
+        }
+    }
+    starts
+}
+
+/// Source line containing character `index`.
+fn editor_line_at(starts: &[usize], index: usize) -> usize {
+    starts
+        .partition_point(|start| *start <= index)
+        .saturating_sub(1)
+}
+
+/// Computes card bands from the laid-out galley of the current frame.
+fn editor_code_card_bands(galley: &egui::epaint::Galley, text: &str) -> Vec<EditorCodeBand> {
+    let ranges = editor_code_line_ranges(text);
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let starts = editor_line_starts(text);
+    let mut bands = Vec::new();
+    for (first_line, last_line, language) in ranges {
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        let mut char_pos = 0usize;
+        for row in &galley.rows {
+            let row_chars = row.row.glyphs.len() + usize::from(row.ends_with_newline);
+            let row_start = char_pos;
+            let row_end = char_pos + row_chars;
+            char_pos = row_end;
+            let first = editor_line_at(&starts, row_start);
+            let last = editor_line_at(&starts, row_end.saturating_sub(1).max(row_start));
+            if last < first_line || first > last_line {
+                continue;
+            }
+            let rect = row.rect();
+            top = top.min(rect.top());
+            bottom = bottom.max(rect.bottom());
+        }
+        if top.is_finite() && bottom > top {
+            bands.push(EditorCodeBand {
+                top,
+                bottom,
+                language,
+            });
+        }
+    }
+    bands
+}
+
+/// Paints the cached code-block cards behind the text.
+///
+/// The top padding leaves room for the language label without putting
+/// non-source text into the editable buffer.
+fn paint_editor_code_cards(ui: &Ui, origin: egui::Pos2, width: f32, bands: &[EditorCodeBand]) {
+    let painter = ui.painter();
+    for band in bands {
+        let rect = Rect::from_min_max(
+            origin + Vec2::new(-14.0, band.top - 30.0),
+            origin + Vec2::new(width + 14.0, band.bottom + 8.0),
+        );
+        painter.rect_filled(rect, CornerRadius::same(10), palette().bg2);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(10),
+            Stroke::new(1.0, palette().stroke),
+            egui::StrokeKind::Inside,
+        );
+        let label = if band.language.is_empty() {
+            "code"
+        } else {
+            &band.language
+        };
+        painter.text(
+            origin + Vec2::new(14.0, band.top - 22.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            FontId::monospace(10.5),
+            palette().faint,
+        );
+    }
+}
+
+/// Base typography of an editor run, before inline Markdown is applied.
+#[derive(Clone, Copy)]
+struct InlineBase {
+    size: f32,
+    color: Color32,
+    bold: bool,
+    italic: bool,
+    mono: bool,
+    /// Explicit row height, so prose matches the preview's airy spacing.
+    line_height: Option<f32>,
+}
+
+impl InlineBase {
+    fn body(size: f32) -> Self {
+        Self {
+            size,
+            color: palette().text,
+            bold: false,
+            italic: false,
+            mono: false,
+            line_height: Some(size * 1.6),
+        }
+    }
+}
+
+/// Inline emphasis state while scanning a line.
+#[derive(Clone, Copy, Default)]
+struct EditorInlineStyle {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    code: bool,
+    highlight: bool,
+    link: bool,
+    url: bool,
+}
+
+/// Font format for a run with the given inline style on top of `base`.
+fn inline_format(base: InlineBase, style: EditorInlineStyle) -> TextFormat {
+    let p = palette();
+    if style.code {
+        let mut f = TextFormat::simple(FontId::monospace(base.size * 0.9), p.sy_plain);
+        f.background = p.bg2;
+        f.expand_bg = 2.0;
+        f.line_height = base.line_height.map(|height| height.max(base.size * 1.5));
+        if style.highlight {
+            f.background = p.highlight_bg;
+            f.color = p.highlight_text;
+        }
+        return f;
+    }
+    if style.url {
+        let mut f = TextFormat::simple(FontId::proportional(base.size * 0.92), p.muted);
+        f.line_height = base.line_height;
+        return f;
+    }
+    let bold = base.bold || style.bold;
+    let italic = base.italic || style.italic;
+    let family = match (bold, italic) {
+        (true, true) => egui::FontFamily::Name("bold-italic".into()),
+        (true, false) => egui::FontFamily::Name("bold".into()),
+        (false, true) => egui::FontFamily::Name("italic".into()),
+        (false, false) if base.mono => egui::FontFamily::Monospace,
+        (false, false) => egui::FontFamily::Proportional,
+    };
+    let mut f = TextFormat::simple(
+        FontId::new(
+            if base.mono {
+                base.size * 0.9
+            } else {
+                base.size
+            },
+            family,
+        ),
+        if style.link { p.accent } else { base.color },
+    );
+    f.line_height = base.line_height;
+    if style.link {
+        f.underline = Stroke::new(1.0, p.accent);
+    }
+    if style.strike {
+        f.strikethrough = Stroke::new(1.0, p.muted);
+    }
+    if style.highlight {
+        f.background = p.highlight_bg;
+        f.color = p.highlight_text;
+        f.expand_bg = 2.0;
+    }
+    f
+}
+
+/// Style for Markdown syntax characters (`#`, `**`, `[`, …).
+///
+/// On the active line they are dimmed and editable; elsewhere they are
+/// transparent and nearly zero-width, so the source reads as rich text. They
+/// remain in the buffer, so the caret and selection keep exact source
+/// positions.
+fn editor_marker_format(base: &InlineBase, visible: bool) -> TextFormat {
+    let (size, color) = if visible {
+        (base.size * 0.92, palette().faint)
+    } else {
+        (base.size * 0.1, Color32::TRANSPARENT)
+    };
+    let mut f = TextFormat::simple(FontId::proportional(size), color);
+    f.line_height = base.line_height;
+    f
+}
+
+/// Fully collapsed source line (an inactive code fence or table delimiter).
+fn collapsed_line_format() -> TextFormat {
+    let mut f = TextFormat::simple(FontId::proportional(0.1), Color32::TRANSPARENT);
+    f.line_height = Some(1.0);
+    f
+}
+
+/// Finds a run of exactly `len` `byte` characters, returning its start offset.
+fn find_marker_run(text: &str, byte: u8, len: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == byte {
+            let start = i;
+            while i < bytes.len() && bytes[i] == byte {
+                i += 1;
+            }
+            if i - start == len {
+                return Some(start);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// True when `text` contains an unescaped closing `token`.
+fn has_closing_marker(text: &str, token: &str) -> bool {
+    text.contains(token)
+}
+
+/// Destination ranges of `[label](url)`, `![alt](url)` and `[label][id]`.
+struct InlineLink {
+    label: (usize, usize),
+    destination: Option<(usize, usize)>,
+    end: usize,
+}
+
+/// Parses a Markdown link or image starting at `text` (`prefix` is 1 for
+/// `[` and 2 for `![`). Only same-line destinations are recognized.
+fn parse_inline_link(text: &str, prefix: usize) -> Option<InlineLink> {
+    let label_end = text[prefix..].find(']')? + prefix;
+    let label = (prefix, label_end);
+    let after = text.get(label_end + 1..)?;
+    if let Some(inner) = after.strip_prefix('(') {
+        let end_paren = inner.find(')')?;
+        return Some(InlineLink {
+            label,
+            destination: Some((label_end + 2, label_end + 2 + end_paren)),
+            end: label_end + 2 + end_paren + 1,
+        });
+    }
+    if let Some(inner) = after.strip_prefix('[') {
+        let end_bracket = inner.find(']')?;
+        return Some(InlineLink {
+            label,
+            destination: Some((label_end + 2, label_end + 2 + end_bracket)),
+            end: label_end + 2 + end_bracket + 1,
+        });
+    }
+    None
+}
+
+/// Appends one line of inline Markdown (`**bold**`, `code`, links, math, …)
+/// with live styling. Markdown punctuation stays visible but is dimmed.
+fn push_inline(job: &mut egui::text::LayoutJob, text: &str, base: InlineBase, show_markers: bool) {
+    let marker = editor_marker_format(&base, show_markers);
+    let mut style = EditorInlineStyle::default();
+    let mut i = 0usize;
+    while i < text.len() {
+        let rest = &text[i..];
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        let ch_len = ch.len_utf8();
+
+        // Backslash escapes keep the following character literal.
+        if ch == '\\'
+            && rest.len() > ch_len
+            && let Some(next) = rest[ch_len..].chars().next()
+        {
+            let next_len = next.len_utf8();
+            job.append(&rest[..ch_len], 0.0, marker.clone());
+            job.append(
+                &rest[ch_len..ch_len + next_len],
+                0.0,
+                inline_format(base, style),
+            );
+            i += ch_len + next_len;
+            continue;
+        }
+
+        // Inline code spans.
+        if ch == '`' {
+            let run = rest.bytes().take_while(|b| *b == b'`').count();
+            if run > 0
+                && let Some(close) = find_marker_run(&rest[run..], b'`', run)
+            {
+                let content_end = run + close;
+                job.append(&rest[..run], 0.0, marker.clone());
+                job.append(
+                    &rest[run..content_end],
+                    0.0,
+                    inline_format(
+                        base,
+                        EditorInlineStyle {
+                            code: true,
+                            ..style
+                        },
+                    ),
+                );
+                job.append(&rest[content_end..content_end + run], 0.0, marker.clone());
+                i += content_end + run;
+                continue;
+            }
+        }
+
+        // Inline and display math (`$…$`, `$$…$$`).
+        if ch == '$' {
+            let run = rest.bytes().take_while(|b| *b == b'$').count().min(2);
+            let close_token = if run == 2 { "$$" } else { "$" };
+            if let Some(close) = rest[run..].find(close_token) {
+                let content_end = run + close;
+                job.append(&rest[..run], 0.0, marker.clone());
+                job.append(
+                    &rest[run..content_end],
+                    0.0,
+                    inline_format(
+                        base,
+                        EditorInlineStyle {
+                            code: true,
+                            highlight: true,
+                            ..style
+                        },
+                    ),
+                );
+                let end = content_end + close_token.len();
+                if let Some(closing) = rest.get(content_end..end) {
+                    job.append(closing, 0.0, marker.clone());
+                }
+                i += end;
+                continue;
+            }
+        }
+
+        // Wiki links `[[Note]]`.
+        if rest.starts_with("[[")
+            && let Some(close) = rest[2..].find("]]")
+        {
+            let content_end = 2 + close;
+            job.append("[[", 0.0, marker.clone());
+            job.append(
+                &rest[2..content_end],
+                0.0,
+                inline_format(
+                    base,
+                    EditorInlineStyle {
+                        link: true,
+                        ..style
+                    },
+                ),
+            );
+            job.append("]]", 0.0, marker.clone());
+            i = content_end + 2;
+            continue;
+        }
+
+        // Images and links.
+        if ch == '[' || rest.starts_with("![") {
+            let prefix = if ch == '!' { 2 } else { 1 };
+            if let Some(link) = parse_inline_link(rest, prefix) {
+                job.append(&rest[..prefix], 0.0, marker.clone());
+                job.append(
+                    &rest[link.label.0..link.label.1],
+                    0.0,
+                    inline_format(
+                        base,
+                        EditorInlineStyle {
+                            link: true,
+                            ..style
+                        },
+                    ),
+                );
+                if let Some((start, end)) = link.destination {
+                    job.append(&rest[link.label.1..start], 0.0, marker.clone());
+                    job.append(
+                        &rest[start..end],
+                        0.0,
+                        inline_format(base, EditorInlineStyle { url: true, ..style }),
+                    );
+                    if let Some(close) = rest.get(end..end + 1) {
+                        job.append(close, 0.0, marker.clone());
+                    }
+                } else {
+                    job.append(&rest[link.label.1..link.end], 0.0, marker.clone());
+                }
+                i += link.end;
+                continue;
+            }
+        }
+
+        // Autolinks and inline HTML tags.
+        if ch == '<'
+            && let Some(close) = rest.find('>')
+        {
+            let inner = &rest[1..close];
+            let f = if inner.starts_with("http://")
+                || inner.starts_with("https://")
+                || inner.starts_with("mailto:")
+                || (inner.contains('@') && !inner.contains(' '))
+            {
+                inline_format(base, EditorInlineStyle { url: true, ..style })
+            } else {
+                marker.clone()
+            };
+            job.append("<", 0.0, marker.clone());
+            job.append(inner, 0.0, f);
+            job.append(">", 0.0, marker.clone());
+            i += close + 1;
+            continue;
+        }
+
+        // Emphasis markers, longest first so `***` toggles both.
+        let mut marker_matched = false;
+        for (token, both, bold, italic, strike, highlight) in [
+            ("***", true, true, true, false, false),
+            ("___", true, true, true, false, false),
+            ("**", false, true, false, false, false),
+            ("__", false, true, false, false, false),
+            ("~~", false, false, false, true, false),
+            ("==", false, false, false, false, true),
+            ("*", false, false, true, false, false),
+            ("_", false, false, true, false, false),
+        ] {
+            if !rest.starts_with(token) {
+                continue;
+            }
+            // A marker already on is a closing marker, even at the end of the
+            // line where no further token remains.
+            let closing = if both {
+                style.bold && style.italic
+            } else {
+                (bold && style.bold)
+                    || (italic && style.italic)
+                    || (strike && style.strike)
+                    || (highlight && style.highlight)
+            };
+            if !closing && !has_closing_marker(&rest[token.len()..], token) {
+                continue;
+            }
+            // `_` inside a word is literal, not emphasis.
+            if token.starts_with('_') {
+                let prev = text[..i].chars().next_back();
+                let next = rest[token.len()..].chars().next();
+                if prev.is_some_and(char::is_alphanumeric)
+                    && next.is_some_and(char::is_alphanumeric)
+                {
+                    continue;
+                }
+            }
+            if both {
+                style.bold = !style.bold;
+                style.italic = !style.italic;
+            } else {
+                style.bold ^= bold;
+                style.italic ^= italic;
+                style.strike ^= strike;
+                style.highlight ^= highlight;
+            }
+            job.append(token, 0.0, marker.clone());
+            i += token.len();
+            marker_matched = true;
+            break;
+        }
+        if marker_matched {
+            continue;
+        }
+
+        job.append(&rest[..ch_len], 0.0, inline_format(base, style));
+        i += ch_len;
+    }
+}
+
+/// Appends a table row, dimming the pipe separators between cells.
+fn push_table_row(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    base: InlineBase,
+    show_markers: bool,
+) {
+    // Interior pipes separate cells and stay readable. The outer pipes are
+    // pure source noise on an inactive line, so only an active line shows them.
+    let marker = editor_marker_format(&base, true);
+    let hidden_marker = editor_marker_format(&base, false);
+    let first_pipe = text.find('|');
+    let last_pipe = text.rfind('|');
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        if ch == '|' && !text[..index].ends_with('\\') {
+            push_inline(job, &text[start..index], base, show_markers);
+            let outer = !show_markers && (Some(index) == first_pipe || Some(index) == last_pipe);
+            job.append(
+                "|",
+                0.0,
+                if outer {
+                    hidden_marker.clone()
+                } else {
+                    marker.clone()
+                },
+            );
+            start = index + 1;
+        }
+    }
+    push_inline(job, &text[start..], base, show_markers);
+}
+
+/// Number of leading block-quote markers (`>` plus one following space).
+fn quote_prefix_len(line: &str) -> usize {
+    let mut i = 0;
+    loop {
+        let spaces = line[i..].bytes().take_while(|b| *b == b' ').count();
+        if spaces > 3 {
+            return i;
+        }
+        let after_spaces = i + spaces;
+        if !line[after_spaces..].starts_with('>') {
+            return i;
+        }
+        i = after_spaces + 1;
+        if line[i..].starts_with(' ') {
+            i += 1;
+        }
+    }
+}
+
+/// Fence marker and length when `line` opens a fenced code block.
+fn fence_opener(line: &str) -> Option<(u8, usize, usize)> {
+    let body_start = quote_prefix_len(line);
+    let body = &line[body_start..];
+    let indent = body.bytes().take_while(|b| *b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &body[indent..];
+    let byte = match rest.as_bytes().first() {
+        Some(b'`') => b'`',
+        Some(b'~') => b'~',
+        _ => return None,
+    };
+    let len = rest.bytes().take_while(|b| *b == byte).count();
+    if len < 3 {
+        return None;
+    }
+    Some((byte, len, body_start + indent + len))
+}
+
+/// True when `line` closes a fenced code block opened with `byte` × `len`.
+fn fence_closes(line: &str, byte: u8, len: usize) -> bool {
+    let body = &line[quote_prefix_len(line)..];
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with(byte as char) {
+        return false;
+    }
+    let run = trimmed.bytes().take_while(|b| *b == byte).count();
+    run >= len && trimmed[run..].trim().is_empty()
+}
+
+/// GFM table delimiter row (`| --- | :---: |`).
+fn is_table_separator(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.contains('-')
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+/// ATX / Setext horizontal rule or underline.
+fn is_rule_like(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    matches!(first, '*' | '-' | '_' | '=')
+        && trimmed.chars().all(|c| c == first || c == ' ' || c == '\t')
+        && trimmed.chars().filter(|c| *c == first).count() >= 3
+}
+
+/// Length of a list marker (`-`, `*`, `+`, `1.`, `1)`) including no space.
+fn list_marker_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    match bytes.first() {
+        Some(b'-' | b'*' | b'+') if bytes.get(1).is_some_and(u8::is_ascii_whitespace) => Some(1),
+        Some(b'0'..=b'9') => {
+            let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            match bytes.get(digits) {
+                Some(b'.' | b')') if bytes.get(digits + 1).is_some_and(u8::is_ascii_whitespace) => {
+                    Some(digits + 1)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// State carried from one source line to the next while styling the editor.
+#[derive(Default)]
+struct EditorLineState {
+    fence: Option<(u8, usize)>,
+    /// YAML/TOML front-matter delimiter, until the matching line appears.
+    front_matter: Option<&'static str>,
+}
+
+/// Per-line inputs that are constant for the whole document.
+#[derive(Clone, Copy)]
+struct EditorLineContext {
+    font_size: f32,
+    first_line: bool,
+    has_front_matter: bool,
+    show_markers: bool,
+    table_header: bool,
+}
+
+/// Styles one source line into `job` (without its line ending).
+///
+/// Returns `true` when the line was collapsed to (almost) zero height, which
+/// the caller uses for the line ending as well. Inactive code fences and table
+/// delimiter rows disappear this way.
+fn paint_editor_line(
+    job: &mut egui::text::LayoutJob,
+    line: &str,
+    state: &mut EditorLineState,
+    context: EditorLineContext,
+) -> bool {
+    let EditorLineContext {
+        font_size,
+        first_line,
+        has_front_matter,
+        show_markers,
+        table_header,
+    } = context;
+    let p = palette();
+    let mut base = InlineBase::body(font_size);
+    let marker = editor_marker_format(&base, show_markers);
+    let visible_marker = editor_marker_format(&base, true);
+    let trimmed = line.trim();
+
+    // Front matter is metadata, not prose: keep it readable but quiet.
+    if let Some(close) = state.front_matter {
+        let mut f = TextFormat::simple(FontId::monospace(font_size * 0.88), p.faint);
+        f.line_height = Some(font_size * 1.45);
+        job.append(line, 0.0, f);
+        if trimmed == close {
+            state.front_matter = None;
+        }
+        return false;
+    }
+    if first_line && has_front_matter && (trimmed == "---" || trimmed == "+++") {
+        state.front_matter = Some(if trimmed == "---" { "---" } else { "+++" });
+        let mut f = TextFormat::simple(FontId::monospace(font_size * 0.88), p.faint);
+        f.line_height = Some(font_size * 1.45);
+        job.append(line, 0.0, f);
+        return false;
+    }
+
+    // Fenced code: everything is monospace until the closing fence.
+    if let Some((byte, len)) = state.fence {
+        let closes = fence_closes(line, byte, len);
+        if !show_markers {
+            if closes {
+                job.append(line, 0.0, collapsed_line_format());
+                state.fence = None;
+                return true;
+            }
+            let mut f = TextFormat::simple(FontId::monospace(font_size * 0.9), p.sy_plain);
+            f.line_height = Some(font_size * 1.55);
+            // A visual indent separates the code block from the prose.
+            job.append(line, 14.0, f);
+            return false;
+        }
+        if closes {
+            job.append(line, 0.0, marker);
+            state.fence = None;
+        } else {
+            let mut f = TextFormat::simple(FontId::monospace(font_size * 0.9), p.sy_plain);
+            f.line_height = Some(font_size * 1.55);
+            job.append(line, 0.0, f);
+        }
+        return false;
+    }
+    if let Some((byte, len, info_start)) = fence_opener(line) {
+        state.fence = Some((byte, len));
+        if !show_markers {
+            // Reserve the card header (language label) above the code instead
+            // of collapsing the opening fence to nothing.
+            let mut f = collapsed_line_format();
+            f.line_height = Some(font_size * 2.0);
+            job.append(line, 0.0, f);
+            return false;
+        }
+        job.append(&line[..info_start], 0.0, marker);
+        let mut f = TextFormat::simple(FontId::monospace(font_size * 0.82), p.accent);
+        f.line_height = Some(font_size * 1.55);
+        job.append(&line[info_start..], 0.0, f);
+        return false;
+    }
+
+    // Block-quote markers stay faint; quoted prose is secondary.
+    let quote_len = quote_prefix_len(line);
+    if quote_len > 0 {
+        // A visible marker is the fallback for the reference's left quote bar.
+        job.append(&line[..quote_len], 0.0, visible_marker.clone());
+        base.color = p.muted;
+    }
+    let body = &line[quote_len..];
+    let indent = body.bytes().take_while(|b| *b == b' ').count();
+    let content = &body[indent..];
+
+    // ATX headings.
+    let hashes = content.bytes().take_while(|b| *b == b'#').count();
+    if (1..=6).contains(&hashes)
+        && (content.len() == hashes || content.as_bytes().get(hashes) == Some(&b' '))
+    {
+        job.append(&body[..indent], 0.0, marker.clone());
+        job.append(&content[..hashes], 0.0, marker.clone());
+        let mut start = hashes;
+        if content.as_bytes().get(hashes) == Some(&b' ') {
+            job.append(" ", 0.0, marker.clone());
+            start += 1;
+        }
+        let scale = match hashes {
+            1 => 1.55,
+            2 => 1.40,
+            3 => 1.24,
+            4 => 1.12,
+            5 => 1.04,
+            _ => 0.96,
+        };
+        let size = font_size * scale;
+        let heading = InlineBase {
+            size,
+            color: p.text,
+            bold: true,
+            line_height: Some(size * 1.55),
+            ..base
+        };
+        push_inline(job, &content[start..], heading, show_markers);
+        return false;
+    }
+
+    // Rules and Setext underlines.
+    if is_rule_like(content) {
+        job.append(&body[..indent], 0.0, visible_marker.clone());
+        job.append(content, 0.0, visible_marker);
+        return false;
+    }
+
+    // Lists (including task items).
+    if let Some(marker_len) = list_marker_len(content) {
+        let mut marker_format = TextFormat::simple(FontId::monospace(font_size * 0.95), p.accent);
+        marker_format.line_height = base.line_height;
+        job.append(&body[..indent], 0.0, marker.clone());
+        job.append(&content[..marker_len], 0.0, marker_format);
+        let rest = &content[marker_len..];
+        let spaces = rest
+            .bytes()
+            .take_while(|b| *b == b' ' || *b == b'\t')
+            .count();
+        job.append(&rest[..spaces], 0.0, marker.clone());
+        let rest = &rest[spaces..];
+        if rest.starts_with("[ ]") || rest.starts_with("[x]") || rest.starts_with("[X]") {
+            let checked = rest.starts_with("[x]") || rest.starts_with("[X]");
+            let color = if checked { p.green } else { p.faint };
+            let mut f = TextFormat::simple(FontId::monospace(font_size * 0.9), color);
+            f.line_height = base.line_height;
+            job.append(&rest[..3], 0.0, f);
+            push_inline(job, &rest[3..], base, show_markers);
+        } else {
+            push_inline(job, rest, base, show_markers);
+        }
+        return false;
+    }
+
+    // Tables: the delimiter row is pure syntax and disappears when inactive.
+    if is_table_separator(content) {
+        if !show_markers {
+            job.append(line, 0.0, collapsed_line_format());
+            return true;
+        }
+        job.append(&body[..indent], 0.0, marker.clone());
+        job.append(content, 0.0, marker);
+        return false;
+    }
+    if content.starts_with('|') || content.ends_with('|') {
+        job.append(&body[..indent], 0.0, marker);
+        if table_header {
+            base.bold = true;
+        }
+        push_table_row(job, content, base, show_markers);
+        return false;
+    }
+
+    job.append(&body[..indent], 0.0, marker);
+    push_inline(job, content, base, show_markers);
+    false
+}
+
+/// Builds the styled editor layout for the whole document.
+///
+/// `active` is the inclusive source-line range whose Markdown markers stay
+/// visible (the caret's line or the selected lines). Everywhere else the
+/// markers are transparent, giving the rich-text appearance of the reference
+/// editor while the buffer remains the exact Markdown source.
+fn markdown_editor_job(
+    text: &str,
+    font_size: f32,
+    active: Option<(usize, usize)>,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob {
+        // The editor must preserve authored trailing spaces, as TextEdit does.
+        keep_trailing_whitespace: true,
+        ..Default::default()
+    };
+    let mut state = EditorLineState::default();
+    // A leading `---` is only front matter when a matching delimiter closes
+    // it; otherwise it is an ordinary horizontal rule.
+    let first = text.lines().next().unwrap_or("").trim();
+    let has_front_matter =
+        matches!(first, "---" | "+++") && text.lines().skip(1).any(|line| line.trim() == first);
+    let lines: Vec<(&str, &str)> = text
+        .split_inclusive('\n')
+        .map(|raw| {
+            if let Some(line) = raw.strip_suffix("\r\n") {
+                (line, "\r\n")
+            } else if let Some(line) = raw.strip_suffix('\n') {
+                (line, "\n")
+            } else {
+                (raw, "")
+            }
+        })
+        .collect();
+    for (index, (line, ending)) in lines.iter().enumerate() {
+        let show_markers = active.is_some_and(|(from, to)| index >= from && index <= to);
+        // A GFM header row is the row immediately above the delimiter row.
+        let table_header = lines
+            .get(index + 1)
+            .is_some_and(|(next, _)| is_table_separator(next));
+        let collapsed = paint_editor_line(
+            &mut job,
+            line,
+            &mut state,
+            EditorLineContext {
+                font_size,
+                first_line: index == 0,
+                has_front_matter,
+                show_markers,
+                table_header,
+            },
+        );
+        if !ending.is_empty() {
+            let height = if collapsed {
+                1.0
+            } else if line.trim().is_empty() {
+                font_size * 0.9
+            } else {
+                font_size * 1.55
+            };
+            let mut f = TextFormat::simple(
+                FontId::proportional(if collapsed { 0.1 } else { font_size }),
+                if collapsed {
+                    Color32::TRANSPARENT
+                } else {
+                    palette().text
+                },
+            );
+            f.line_height = Some(height);
+            job.append(ending, 0.0, f);
+        }
+    }
+    job
+}
+
+/// Source lines whose Markdown markers should be visible.
+///
+/// Returns `None` when the editor does not have keyboard focus, which hides
+/// every marker and lets the document read as rich text. Otherwise the caret's
+/// line — or the full selected line range — is returned (0-based, inclusive).
+fn editor_active_lines(
+    ctx: &egui::Context,
+    editor_id: egui::Id,
+    text: &str,
+) -> Option<(usize, usize)> {
+    if !ctx.memory(|memory| memory.has_focus(editor_id)) {
+        return None;
+    }
+    let state = egui::widgets::text_edit::TextEditState::load(ctx, editor_id)?;
+    let range = state.cursor.char_range()?;
+    let line_of = |index: egui::text::CCursor| char_to_line_col(text, index.index.0).0 - 1;
+    let a = line_of(range.primary);
+    let b = line_of(range.secondary);
+    Some((a.min(b), a.max(b)))
+}
+
+/// Raw Markdown editor for the block that is currently open. Returns `true`
+/// if the text changed.
+///
+/// The caller places this inside the rich document at the block's position;
+/// the custom layouter styles the source as it is typed. `cursor_key` caches
+/// the status-bar line and column per character index and preview revision.
 ///
 /// Keyboard Cmd+X/C/V is handled by egui's `TextEdit`. This function adds a
 /// right-click menu and Ctrl+X/C/V fallbacks so clipboard actions also work
 /// for users who do not use the macOS Cmd shortcuts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of editor state"
+)]
 fn editor_ui(
     ui: &mut Ui,
     text: &mut String,
+    column_width: f32,
     font_size: f32,
     last_cursor: &mut (usize, usize),
     cursor_key: &mut Option<(usize, u64)>,
@@ -3004,13 +3972,57 @@ fn editor_ui(
                 );
             }
 
+            // The caret's line (or every selected line) reveals its Markdown
+            // markers; all other lines read as rich text.
+            let active = editor_active_lines(&ctx, editor_id, text);
+
+            // Live Markdown styling: headings, emphasis, code, quotes and
+            // links read like the preview, while the buffer stays raw source.
+            let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+                let mut job =
+                    (*cached_editor_job(ui.ctx(), buffer.as_str(), font_size, active)).clone();
+                job.wrap.max_width = wrap_width;
+                ui.fonts_mut(|fonts| fonts.layout_job(job))
+            };
+            let editor_width = column_width;
+            let editor_rows = text.lines().count().max(1);
+            let editor_min_height = ui.available_height();
+            let editor_origin = ui.cursor().min;
+            if let Some(cards) =
+                ctx.data(|data| data.get_temp::<EditorCodeCards>(editor_code_cards_id()))
+                && cards.font == font_size.to_bits()
+            {
+                paint_editor_code_cards(ui, editor_origin, editor_width, &cards.bands);
+            }
             let out = egui::TextEdit::multiline(text)
                 .id_salt("md_editor")
-                .code_editor()
-                .font(FontId::monospace(font_size * 0.9))
+                .font(FontId::proportional(font_size))
+                .lock_focus(true)
+                .frame(Frame::NONE)
+                .margin(Margin::same(0))
                 .hint_text("Write Markdown here …")
-                .desired_width(ui.available_width())
+                .desired_width(editor_width)
+                .desired_rows(editor_rows)
+                .min_size(Vec2::new(editor_width, editor_min_height))
+                .layouter(&mut layouter)
                 .show(ui);
+
+            // Refresh the card cache from this frame's galley. Request one
+            // repaint when it changed so the cards appear without an input
+            // event.
+            let bands = editor_code_card_bands(&out.galley, text);
+            let cards = EditorCodeCards {
+                font: font_size.to_bits(),
+                bands,
+            };
+            let cards_changed = ctx.data(|data| {
+                data.get_temp::<EditorCodeCards>(editor_code_cards_id())
+                    .is_none_or(|old| old.font != cards.font || old.bands != cards.bands)
+            });
+            if cards_changed {
+                ctx.data_mut(|data| data.insert_temp(editor_code_cards_id(), cards));
+                ctx.request_repaint();
+            }
 
             // Scroll the target line into the middle of the editor pane.
             if jump.is_some()
@@ -3171,10 +4183,10 @@ fn editor_ui(
 
 /// Rendered Markdown body (scroll area + centered reading column).
 ///
-/// Used by the full-window Preview and by the right half of the Edit split.
-/// A click on an inline image is written to `image_click`; the caller opens
-/// the modal viewer after rendering (this function only borrows the document).
-/// Returns the source line of a click on a block; only Edit mode acts on it.
+/// Used by the full-window Preview. A click on an inline image is written to
+/// `image_click`; the caller opens the modal viewer after rendering (this
+/// function only borrows the document). Returns the source line of a
+/// double-click on a block, which the caller uses to enter Edit mode there.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the render pipeline; each argument is a distinct input"
@@ -3282,9 +4294,12 @@ fn preview_ui(
         *preview_top_line = line;
     }
 
-    // Click in the preview → the source line the caller should jump to.
-    if ui.input(|i| i.pointer.primary_clicked())
-        && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+    // Double-click in the preview → the source line the caller should jump to.
+    // A single click stays available for links, images and checkboxes.
+    if ui.input(|i| {
+        i.pointer
+            .button_double_clicked(egui::PointerButton::Primary)
+    }) && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
         && let Some(line) = source_line_at(&hits, pos)
     {
         ui.ctx().request_repaint();
@@ -3423,8 +4438,7 @@ fn apply_theme(ctx: &egui::Context) {
 /// line length.
 fn preview_column(ui: &mut Ui, f: f32, full_width: bool, add: impl FnOnce(&mut Ui)) {
     // Full preview: keep a proportional side margin (never collapse to zero)
-    // while capping the line length. Split panes are already inset by their
-    // frame margins and use their available width.
+    // while capping the line length so both full-window modes share a measure.
     let max_w = (f * 62.0).clamp(640.0, 1080.0);
     let avail = ui.available_width();
     let (width, left) = if full_width {
@@ -6423,7 +7437,7 @@ fn render_mermaid(ui: &mut Ui, src: &str, f: f32) {
     ui.add_space(f * 0.55);
 }
 
-/// Mermaid textures kept in egui memory. Edits in split view add a texture
+/// Mermaid textures kept in egui memory. Edits add a texture
 /// per changed diagram, so the cache is cleared once it reaches this size.
 const MERMAID_CACHE_LIMIT: usize = 32;
 
@@ -7163,8 +8177,8 @@ impl eframe::App for App {
 
         self.guard_window_close(&ctx);
 
-        // While a modal is open it owns the input: no document shortcuts, no
-        // split/view changes behind it.
+        // While a modal is open it owns the input: no document shortcuts and
+        // no view changes behind it.
         if self.image_viewer.is_none()
             && !self.close_dialog
             && !self.weasyprint_dialog
@@ -7193,7 +8207,7 @@ impl eframe::App for App {
         });
         match self.mode {
             ViewMode::Preview => self.preview_central(ui),
-            ViewMode::Editor => self.edit_split(ui),
+            ViewMode::Editor => self.editor_central(ui),
         }
         // A link click in the preview may target another document.
         if let Some(path) = ctx.data_mut(|data| data.remove_temp::<PathBuf>(pending_open_id())) {
@@ -7482,7 +8496,6 @@ mod tab_tests {
             find_index: 0,
             find_cache: (String::new(), 0),
             find_focus: false,
-            split_fraction: 0.5,
             font_size: DEFAULT_FONT_SIZE,
             status: None,
             export_job: None,
@@ -7852,6 +8865,170 @@ mod tab_tests {
 }
 
 #[cfg(test)]
+mod editor_style_tests {
+    use super::*;
+
+    /// Format of the first section that contains `needle`.
+    fn format_at<'a>(job: &'a egui::text::LayoutJob, needle: &str) -> &'a TextFormat {
+        let start = job.text.find(needle).expect("needle in editor text");
+        job.sections
+            .iter()
+            .find(|section| section.byte_range.start.0 <= start && start < section.byte_range.end.0)
+            .map(|section| &section.format)
+            .unwrap_or_else(|| panic!("no format for {needle}"))
+    }
+
+    #[test]
+    fn editor_layout_covers_the_source_exactly() {
+        let text = "# Title\n\n**bold** and *italic* and `code`\n\n\
+                    > quote\n\n- [x] done\n\n```rust\nfn main() {}\n```\n\n\
+                    | a | b |\n| --- | --- |\n";
+        let job = markdown_editor_job(text, 16.0, None);
+        assert_eq!(job.text, text);
+        assert_eq!(job.sections.first().unwrap().byte_range.start.0, 0);
+        assert_eq!(job.sections.last().unwrap().byte_range.end.0, text.len());
+        for pair in job.sections.windows(2) {
+            assert_eq!(
+                pair[0].byte_range.end, pair[1].byte_range.start,
+                "editor sections must tile the text without gaps"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_styles_headings_emphasis_code_and_quotes() {
+        let text = "# Title\n\n**bold** *italic* ~~gone~~ `code`\n\n> quote\n\n\
+                    ```rust\nfn main() {}\n```\n";
+        let job = markdown_editor_job(text, 16.0, None);
+
+        let heading = format_at(&job, "Title");
+        assert!(heading.font_id.size > 16.0, "heading is larger");
+        assert_ne!(
+            heading.font_id.family,
+            egui::FontFamily::Proportional,
+            "heading uses the bold face"
+        );
+
+        let bold = format_at(&job, "bold");
+        assert_ne!(bold.font_id.family, egui::FontFamily::Proportional);
+        assert_ne!(
+            format_at(&job, "italic").font_id.family,
+            egui::FontFamily::Proportional,
+            "italic uses the italic face"
+        );
+        assert_ne!(format_at(&job, "gone").strikethrough, Stroke::NONE);
+        assert_eq!(
+            format_at(&job, "code").font_id.family,
+            egui::FontFamily::Monospace
+        );
+        assert_eq!(
+            format_at(&job, "fn main").font_id.family,
+            egui::FontFamily::Monospace,
+            "fenced code is monospace"
+        );
+        assert_eq!(format_at(&job, "quote").color, palette().muted);
+    }
+
+    #[test]
+    fn editor_markers_are_dimmer_than_prose() {
+        let job = markdown_editor_job("# Title\n", 16.0, Some((0, 0)));
+        assert_eq!(format_at(&job, "#").color, palette().faint);
+        assert_eq!(format_at(&job, "Title").color, palette().text);
+    }
+
+    #[test]
+    fn editor_hides_markers_the_caret_is_not_on() {
+        let hidden = markdown_editor_job("**bold** plain\n", 16.0, None);
+        assert_eq!(format_at(&hidden, "**").color, Color32::TRANSPARENT);
+        assert!(format_at(&hidden, "**").font_id.size < 2.0);
+
+        let active = markdown_editor_job("**bold** plain\n", 16.0, Some((0, 0)));
+        assert_eq!(format_at(&active, "**").color, palette().faint);
+    }
+
+    #[test]
+    fn inactive_code_fences_collapse() {
+        let job = markdown_editor_job("```rust\nfn main() {}\n```\n", 16.0, None);
+        // The opening fence keeps header height for the card's language label;
+        // the closing fence collapses completely.
+        assert_eq!(format_at(&job, "```rust").line_height, Some(32.0));
+        assert_eq!(
+            format_at(&job, "fn main").font_id.family,
+            egui::FontFamily::Monospace
+        );
+
+        let active = markdown_editor_job("```rust\nfn main() {}\n```\n", 16.0, Some((0, 0)));
+        assert_eq!(format_at(&active, "```rust").color, palette().faint);
+    }
+
+    #[test]
+    fn a_lone_leading_rule_is_not_front_matter() {
+        let job = markdown_editor_job("---\n\nbody\n", 16.0, None);
+        assert_eq!(format_at(&job, "body").color, palette().text);
+    }
+
+    #[test]
+    fn closing_emphasis_marker_returns_to_plain_text() {
+        let job = markdown_editor_job("**bold** plain\n", 16.0, None);
+        assert_ne!(
+            format_at(&job, "bold").font_id.family,
+            egui::FontFamily::Proportional
+        );
+        let plain = format_at(&job, "plain");
+        assert_eq!(plain.font_id.family, egui::FontFamily::Proportional);
+        assert_eq!(plain.color, palette().text);
+    }
+
+    #[test]
+    fn editor_galley_lays_out_every_line() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        install_system_fonts(&ctx);
+        let mut text =
+            "# Title\n\nFirst paragraph.\n\n## Second\n\n- one\n- two\n\nClosing paragraph.\n"
+                .to_string();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut laid_out = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+                    let mut job = markdown_editor_job(buffer.as_str(), 16.0, None);
+                    job.wrap.max_width = wrap_width;
+                    ui.fonts_mut(|fonts| fonts.layout_job(job))
+                };
+                let out = egui::TextEdit::multiline(&mut text)
+                    .font(FontId::proportional(16.0))
+                    .frame(Frame::NONE)
+                    .layouter(&mut layouter)
+                    .show(ui);
+                laid_out = Some((
+                    out.galley.text().to_string(),
+                    out.galley.size(),
+                    out.response.rect.height(),
+                ));
+            });
+        });
+        output.textures_delta.clear();
+        let (galley_text, size, widget_height) = laid_out.expect("editor galley");
+        assert_eq!(galley_text, text);
+        assert!(
+            size.y > 150.0,
+            "the editor galley should contain all lines, was {size:?}"
+        );
+        assert!(
+            widget_height > 150.0,
+            "the text widget should allocate the full galley, was {widget_height}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod helper_tests {
     use super::*;
 
@@ -8167,7 +9344,7 @@ mod jump_tests {
     }
 
     #[test]
-    fn clicking_preview_requests_a_source_jump() {
+    fn double_clicking_preview_requests_a_source_jump() {
         let doc = crate::parser::parse("# Heading\n\nParagraph one.\n\nParagraph two.\n");
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(900.0, 700.0));
@@ -8179,10 +9356,11 @@ mod jump_tests {
         let mut preview_top_line = 1usize;
         let mut preview_metrics = PreviewMetrics::default();
 
-        // Frame 1: press. Frame 2: release → egui reports `primary_clicked`.
-        for pressed in [true, false] {
+        // Press, release, press, release within the double-click delay.
+        for (pressed, time) in [(true, 0.0), (false, 0.05), (true, 0.10), (false, 0.15)] {
             let mut raw = egui::RawInput {
                 screen_rect: Some(screen),
+                time: Some(time),
                 ..Default::default()
             };
             raw.events.push(egui::Event::PointerMoved(pointer));
@@ -8215,7 +9393,7 @@ mod jump_tests {
         }
         assert!(
             source_jump.is_some(),
-            "a click inside the preview should request a source line"
+            "a double-click inside the preview should request a source line"
         );
     }
 

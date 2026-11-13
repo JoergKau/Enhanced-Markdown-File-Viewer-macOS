@@ -23,7 +23,7 @@
 //! * [`ui`] draws the editor, preview, tab strip, toolbar and status bar with
 //!   egui.
 //! * [`html_export`] renders the raw Markdown source as print-ready HTML
-//!   (based on the reference implementation's pipeline: preprocessors, sanitizer, print
+//!   (print pipeline: preprocessors, sanitizer, print
 //!   template with `.markdown-body` CSS, plus typeset math and Mermaid images).
 //! * [`export`] invokes the `weasyprint` CLI on that HTML and writes the PDF
 //!   only on success; a missing or failing WeasyPrint is reported as an error.

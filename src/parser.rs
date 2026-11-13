@@ -520,8 +520,8 @@ pub struct Document {
     /// YAML/TOML front-matter properties in source order.
     pub metadata: Vec<(String, String)>,
     /// 1-based source line of each entry in [`Document::blocks`]. Used by the
-    /// split view to jump from a clicked preview block to the matching source
-    /// line. The vector is parallel to `blocks` (missing entries → line 1).
+    /// editor to jump from a double-clicked preview block to the matching
+    /// source line. The vector is parallel to `blocks` (missing entries → line 1).
     pub block_lines: Vec<usize>,
 }
 
